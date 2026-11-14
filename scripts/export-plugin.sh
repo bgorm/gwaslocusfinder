@@ -12,9 +12,9 @@ cd "$(dirname "$0")/.."
 # and the internal standalone entry point out of the public source tree.
 files=(
     README.md LICENSE THIRD_PARTY.md Makefile .gitignore
-    src/core.hpp src/io.hpp src/reference.hpp src/entry.hpp src/engine.cpp src/plugin.cpp
+    src/core.hpp src/io.hpp src/storage.hpp src/reference.hpp src/entry.hpp src/engine.cpp src/plugin.cpp
     scripts/bootstrap.sh scripts/export-plugin.sh
-    tests/test_plugin.py .github/workflows/build.yml
+    tests/test_plugin.py tests/test_storage.cpp .github/workflows/build.yml
 )
 for file in "${files[@]}"; do
     [[ -f $file ]] || { echo "Missing source file: $file" >&2; exit 1; }

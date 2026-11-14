@@ -26,7 +26,7 @@ endif
 COMPRESSION_CPPFLAGS ?= $(shell $(PKG_CONFIG) --cflags zlib libzstd 2>/dev/null)
 COMPRESSION_LIBS ?= $(shell $(PKG_CONFIG) --libs zlib libzstd 2>/dev/null || echo -lz -lzstd)
 PROJECT_CPPFLAGS = -Isrc -DLF_WITH_PGEN=$(WITH_PGEN) $(COMPRESSION_CPPFLAGS)
-HEADERS = src/core.hpp src/io.hpp src/reference.hpp src/entry.hpp
+HEADERS = src/core.hpp src/io.hpp src/storage.hpp src/reference.hpp src/entry.hpp
 OBJDIR = $(BUILD_DIR)/plugin-pgen$(WITH_PGEN)
 PG_NAMES =
 ifeq ($(WITH_PGEN),1)
@@ -44,7 +44,7 @@ else
 PLUGIN_LDFLAGS ?= -shared
 endif
 
-.PHONY: all plugin test install export clean FORCE
+.PHONY: all plugin test test-storage install export clean FORCE
 all: plugin
 plugin: $(PLUGIN)
 $(OBJDIR):
@@ -63,7 +63,11 @@ $(OBJDIR)/wrapper.o: src/plugin.cpp src/entry.hpp $(PLUGIN_HTSLIB)/htslib/hts.h 
 # HTSlib and bcftools symbols resolve from the host; no second HTSlib is linked.
 $(PLUGIN): $(PLUGIN_OBJECTS) FORCE
 	$(CXX) $(CXXFLAGS) $(PLUGIN_LDFLAGS) $(LDFLAGS) $(PLUGIN_OBJECTS) $(COMPRESSION_LIBS) -lm -lpthread $(LDLIBS) -o $@
-test: plugin
+$(BUILD_DIR)/test-storage: tests/test_storage.cpp src/storage.hpp src/io.hpp src/core.hpp | $(OBJDIR)
+	$(CXX) $(CPPFLAGS) $(PROJECT_CPPFLAGS) -I$(PLUGIN_HTSLIB) $(CXXFLAGS) -std=c++17 -Wall -Wextra -Wpedantic $< -o $@
+test-storage: $(BUILD_DIR)/test-storage
+	$(BUILD_DIR)/test-storage
+test: plugin test-storage
 	LF_PLUGIN="$(abspath $(PLUGIN))" BCFTOOLS="$(BCFTOOLS)" $(PYTHON) -B -m unittest discover -s tests -p test_plugin.py -v
 install: plugin
 	mkdir -p "$(DESTDIR)$(plugindir)"
@@ -72,7 +76,7 @@ export:
 	@test -n "$(EXPORT_DIR)" || { echo "Usage: make export EXPORT_DIR=/path/to/new-source-directory" >&2; exit 1; }
 	bash scripts/export-plugin.sh "$(EXPORT_DIR)"
 clean:
-	rm -f $(BUILD_DIR)/gwaslocusfinder.so $(BUILD_DIR)/plugin-pgen0/*.o $(BUILD_DIR)/plugin-pgen1/*.o
+	rm -f $(BUILD_DIR)/test-storage $(BUILD_DIR)/gwaslocusfinder.so $(BUILD_DIR)/plugin-pgen0/*.o $(BUILD_DIR)/plugin-pgen1/*.o
 FORCE:
 
 # Local development targets are intentionally omitted from public exports.

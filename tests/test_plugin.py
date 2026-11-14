@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
+import zlib
 import tempfile
 import unittest
 
@@ -135,6 +137,133 @@ class PublicPluginTests(unittest.TestCase):
         self.assertEqual(self.report(prefix, "leads"), [])
         _, _, result = self.run_plugin("unindexed", gwas=self.d / "default.gwas.vcf", ok=False)
         self.assertIn("index", result.stderr.lower())
+
+    def test_vcf_forward_reads_same_position_and_cache_eviction(self):
+        # More than eight metadata blocks and a 1 MiB genotype cache. The
+        # same-position allele order differs from the canonical key order.
+        ref = self.d / "dense.vcf"
+        header = (self.d / "default.ref.vcf").read_text().split("#CHROM")[0]
+        x = [0, 0, 0, 1, 1, 1, 2, 2, 2] * 12
+        y = [0, 1, 2, 0, 1, 2, 0, 1, 2] * 12
+        cells = lambda values: "\t".join(f"0/0:{v}" for v in values)
+        with ref.open("w") as out:
+            out.write(header + "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" +
+                      "\t".join(f"s{i}" for i in range(len(x))) + "\n")
+            for pos in range(1000, 7000):
+                if pos == 6000:
+                    out.write(f"chr1\t{pos}\ty\tA\tT\t.\tPASS\t.\tGT:DS\t{cells(y)}\n")
+                out.write(f"chr1\t{pos}\tx{pos}\tA\tG\t.\tPASS\t.\tGT:DS\t{cells(x)}\n")
+                if pos == 6000:
+                    out.write(f"chr1\t{pos}\tdiscordant\tG\tA\t.\tPASS\t.\tGT:DS\t{cells([0]*len(x))}\n")
+        gwas = self.d / "dense.gwas.vcf"
+        header = (self.d / "default.gwas.vcf").read_text().splitlines()
+        gwas.write_text("\n".join(line for line in header if line.startswith("#")) + "\n" +
+                        "1\t1000\tstart\tA\tG\t.\tPASS\t.\tLP\t18\t40\n" +
+                        "1\t6000\ty\tA\tT\t.\tPASS\t.\tLP\t35\t35\n" +
+                        "1\t6999\tend\tA\tG\t.\tPASS\t.\tLP\t40\t18\n")
+        gwas = self.indexed(gwas)
+        bcf = self.indexed(ref)
+        bgzf = self.d / "dense.vcf.gz"
+        command([BCFTOOLS, "view", "-Oz", "-o", bgzf, "-W", ref])
+        baseline, _, _ = self.run_plugin("dense-large", gwas=gwas, ref=bcf)
+        for i, panel in enumerate([bcf, bgzf]):
+            actual, _, _ = self.run_plugin(f"dense-small-{i}", gwas=gwas, ref=panel,
+                                          specific=["--cache-mb", "1"])
+            for report in ["loci", "independent", "leads", "candidates", "excluded"]:
+                self.assertEqual(self.report(actual, report), self.report(baseline, report))
+            stats = {r["PARAMETER"]: r["VALUE"] for r in self.report(actual, "run")}
+            self.assertEqual(stats["reference_duplicates_skipped"], "1")
+            self.assertGreater(int(stats["genotype_reads"]), 6001)
+            self.assertEqual(stats["reference_variants_qc_evaluated"], "6001")
+            self.assertEqual(stats["reference_variants_qc_passed"], "6001")
+            self.assertEqual(stats["reference_variants_qc_filtered"], "0")
+            self.assertEqual(stats["reference_variants_qc_not_evaluated"], "0")
+            self.assertEqual({r["N_CANDIDATE"] for r in self.report(actual, "loci")}, {"6001"})
+
+    def test_vcf_forward_reads_do_not_cross_window_gaps(self):
+        # Index a BGZF file without parsing its deliberately invalid GT fields.
+        # A valid spacer allows HTSlib's usual single-position lookahead.
+        header = (self.d / "default.ref.vcf").read_text().splitlines()
+        text = "\n".join(line for line in header if line.startswith("#")) + "\n"
+        good = "\t".join(["0/0:0", "0/1:1", "1/1:2"] * 3)
+        bad = "\t".join(["invalid:0"] * 9)
+        for pos, cell in [(1000, good), (1100, good), (5000, bad),
+                          (20000, good), (20100, good), (1000000, bad)]:
+            text += f"chr1\t{pos}\tv{pos}\tA\tG\t.\tPASS\t.\tGT:DS\t{cell}\n"
+        ref = self.d / "gaps.vcf.gz"
+        data = text.encode()
+        with ref.open("wb") as out:
+            for block in [data[i:i+32000] for i in range(0, len(data), 32000)] + [b""]:
+                compressor = zlib.compressobj(wbits=-15)
+                payload = compressor.compress(block) + compressor.flush()
+                out.write(bytes.fromhex("1f8b08040000000000ff060042430200") +
+                          struct.pack("<H", len(payload)+25) + payload +
+                          struct.pack("<II", zlib.crc32(block), len(block)))
+        command([BCFTOOLS, "index", "-t", ref])
+        self.variants = [(1000, "first", [0]*9, 30, 30), (20000, "last", [0]*9, 20, 20)]
+        gwas, _ = self.fixture("gaps-gwas")
+        _, output, _ = self.run_plugin("gaps", gwas=gwas, ref=ref,
+                                       specific=["--ld-kb", "0", "--merge-kb", "0"])
+        self.assertEqual(self.ids(output), ["first", "last"])
+
+    def test_reference_qc_counts_before_and_after_filters(self):
+        x = [0, 1, 2] * 3
+        rare = [1] + [0] * 8
+        self.variants = [(1000, "common", x, 30, 30),
+                         (2000, "rare", rare, 25, 25),
+                         (3000, "constant", [1]*9, 24, 24),
+                         (4000, "monomorphic", [0]*9, 23, 23),
+                         (5000, "weak", x, 1, 1),
+                         (6000, "reference_only", x, 0, 0),
+                         (7000, "rare_candidate", rare, 3, 3),
+                         (8000, "sparse", [0, 1, 2]*3, 22, 22)]
+        self.fixture("qc")
+        gwas = self.d / "qc.gwas.vcf"
+        gwas.write_text("\n".join(line for line in gwas.read_text().splitlines()
+                                  if line.startswith("#") or line.split("\t")[2] != "reference_only") + "\n")
+        ref = self.d / "qc.ref.vcf"
+        lines = ref.read_text().splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if fields[2] == "sparse":
+                fields[12:] = ["./.:."] * 6
+                lines[i] = "\t".join(fields)
+        ref.write_text("\n".join(lines) + "\n")
+        gwas, ref = self.indexed(gwas), self.indexed(ref)
+        for name, options, passed, filtered in [("unfiltered", [], 5, 2),
+                                              ("maf", ["--maf", "0.1"], 3, 4),
+                                              ("both", ["--maf", "0.1", "--min-call-rate", "0.9"], 2, 5)]:
+            prefix, _, result = self.run_plugin("qc-"+name, gwas=gwas, ref=ref, specific=options)
+            stats = {r["PARAMETER"]: r["VALUE"] for r in self.report(prefix, "run")}
+            self.assertEqual(stats["reference_variants_in_windows"], "8")
+            self.assertEqual(stats["reference_variants_qc_evaluated"], "7")
+            self.assertEqual(stats["reference_variants_qc_passed"], str(passed))
+            self.assertEqual(stats["reference_variants_qc_filtered"], str(filtered))
+            self.assertEqual(stats["reference_variants_qc_not_evaluated"], "1")
+            self.assertEqual(stats["genotype_reads"], "7")  # no counting-only reads
+            self.assertIn("8 nearby variants before reference QC", result.stderr)
+            self.assertIn(f"Reference QC: 7 variants evaluated, {passed} passed, {filtered} filtered out; 1 not evaluated (genotypes not needed)", result.stderr)
+
+    def test_temporary_directory_cleanup_and_optional_reports(self):
+        scratch = self.d / "scratch space"
+        scratch.mkdir()
+        sentinel = scratch / "keep.txt"
+        sentinel.write_text("keep")
+        _, expected, _ = self.run_plugin("scratch", specific=["--temp-dir", scratch])
+        self.assertEqual(list(scratch.iterdir()), [sentinel])
+        output = self.d / "without-reports.bcf"
+        command([BCFTOOLS, "+" + str(PLUGIN), "-Ob", "-o", output, self.gwas, "--",
+                 "--vcf-ref", self.ref, "--temp-dir", scratch])
+        self.assertEqual(command([BCFTOOLS, "view", "-H", output]).stdout,
+                         command([BCFTOOLS, "view", "-H", expected]).stdout)
+        self.assertEqual(list(scratch.iterdir()), [sentinel])
+        gwas, ref = self.fixture("bad-scratch", haploid=True)
+        self.run_plugin("bad-scratch", gwas=gwas, ref=ref, specific=["--temp-dir", scratch], ok=False)
+        self.assertEqual(list(scratch.iterdir()), [sentinel])
+        _, _, result = self.run_plugin("missing-scratch", specific=["--temp-dir", scratch / "absent"], ok=False)
+        self.assertIn("Cannot create temporary directory", result.stderr)
 
     def test_build_capabilities_and_disabled_pgen_errors(self):
         help_text = command([BCFTOOLS, "+" + str(PLUGIN), "--help"]).stderr

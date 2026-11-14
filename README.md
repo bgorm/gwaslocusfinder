@@ -32,7 +32,7 @@ bcftools +gwaslocusfinder --help
 <!-- BEGIN GWASLOCUSFINDER HELP -->
 ```text
 About: Find significant loci in GWAS-VCF summary statistics using LD clumping and FUMA-style aggregation.
-(version 0.5.0)
+(version 0.6.0)
 
    Reads indexed GWAS-VCF/BCF summary statistics with FORMAT/LP (-log10 P),
    treating each selected sample column as a separate phenotype.
@@ -90,6 +90,7 @@ Reference panel options:
        --hardcalls                ignore dosages; use unphased hardcall correlation
        --missing-ref <string>     policy for significant variants absent from panel: skip, error [skip]
        --cache-mb <int>           decoded reference genotype cache in MiB [512]
+       --temp-dir <dir>           temporary reference storage directory [TMPDIR or .]
 
 Locus definition options:
        --p1 <float>               significant when GWAS P <= threshold [5e-8]
@@ -237,9 +238,8 @@ make -j4 WITH_PGEN=0 \
 Use `BCFTOOLS=/path/to/bcftools` to select a particular host. Run `make clean`
 before changing compiler flags, dependencies, or host versions. On macOS the
 Makefile uses a native bundle with host-symbol lookup and keeps the `.so`
-extension expected by bcftools. Linux builds are tested locally; CI is configured
-for Linux and macOS with both PGEN settings. A macOS run has not yet been
-verified for this release.
+extension expected by bcftools. CI builds and tests the plugin on Linux and
+macOS, with and without PGEN support.
 
 ### Install and test
 
@@ -530,6 +530,20 @@ LD is squared Pearson correlation of unphased ALT dosages using pairwise-complet
 samples. Phase is ignored. `--hardcalls` uses hardcall allele counts instead.
 Reference `--maf` and `--min-call-rate` are calculated in the selected sample
 subset; monomorphic or constant-dosage variants are always excluded.
+The initial `nearby variants` count is before these checks. The final
+`Reference QC` line reports distinct variants evaluated, passed, filtered out,
+and not evaluated (genotypes not needed) across all selected phenotypes.
+These counts also appear as `reference_variants_qc_evaluated`,
+`reference_variants_qc_passed`, `reference_variants_qc_filtered`, and
+`reference_variants_qc_not_evaluated` in `.run.tsv`. Passed + filtered out +
+not evaluated equals `reference_variants_in_windows`.
+
+QC runs only when a variant's genotypes are needed. Variants outside the
+analyzed candidate blocks, or skipped by candidate eligibility rules, may
+remain unevaluated. The passing count therefore describes evaluated variants;
+it is not an estimate for the unevaluated part of the panel. Counting adds no
+extra genotype scan.
+
 Missing reference signals are skipped and reported by default; use
 `--missing-ref error` to require their presence.
 
@@ -757,10 +771,42 @@ model or evaluate predictive performance.
 
 `--threads` controls HTSlib I/O; LD calculations are currently serial.
 `--cache-mb` bounds the decoded genotype cache, not total process memory.
-Reference metadata, retained GWAS signals, and per-phenotype candidate
-relationships also use memory. Broad P-value cutoffs can substantially increase
-work; candidate blocks and aggregated loci are still constructed when only
-lead variants are needed for scoring.
+Reference metadata is sorted into temporary binary files, with a sparse
+coordinate index and a small block cache in RAM. Phenotype P-values and QC
+annotations are also stored on disk. Candidate relationships are spooled only
+when TSV reports are requested. This requires no additional library.
+
+Use `--temp-dir` to choose scratch storage with sufficient free space:
+
+```sh
+bcftools +gwaslocusfinder -Ob -o index.bcf trait.bcf -- \
+  --pfile reference --temp-dir /path/to/scratch
+```
+
+The default is `$TMPDIR` when set, otherwise the current directory. Choose a
+disk-backed directory: a RAM-backed `/tmp` still consumes memory. A NAS share
+is supported, although its I/O speed affects runtime. Temporary files are
+removed on completion and on reported errors; an interrupted process may leave
+its `gwaslocusfinder.*` directory for manual removal. Sorting can temporarily
+require space for both input runs and merged files; disk use increases with
+reference coverage, phenotype count, and optional candidate reports.
+
+PVAR is scanned once to preserve original PGEN row numbers. PGEN's own
+whole-file indexes, the sparse coordinate index, and retained significant GWAS
+records still use RAM. Memory therefore is not strictly limited to one LD
+window, but full reference metadata and candidate relationships no longer need
+to fit in RAM.
+
+VCF/BCF reference scans use indexed signal windows. The metadata pass skips
+FORMAT parsing; genotype validation occurs when records are fetched for LD.
+Nearby forward genotype reads reuse the reader within the same signal window.
+Text VCF still requires reading and decompressing whole selected records,
+including sample columns, so broad window coverage can involve substantial
+I/O. BCF avoids text parsing and is generally preferable for repeated analyses.
+
+Broad P-value cutoffs can substantially increase work; candidate blocks and
+aggregated loci are still constructed when only lead variants are needed for
+scoring.
 
 LD mode excludes chromosomes other than 1-22 and X, reporting significant
 records as `unsupported_chromosome`. Sex-specific weighting, automatic PAR

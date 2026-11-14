@@ -5,10 +5,10 @@
 #include <iostream>
 
 namespace lf {
-constexpr const char* version = "0.5.0";
+constexpr const char* version = "0.6.0";
 constexpr size_t none = std::numeric_limits<size_t>::max();
 struct Options {
-    std::string input, out, regions, keep, missing = "skip";
+    std::string input, out, regions, keep, temp_dir, missing = "skip";
     std::vector<std::string> prefixes, vcf_refs;
     std::string output = "-", samples = "-", expression;
     std::map<std::string,std::string> outputs;
@@ -109,6 +109,7 @@ std::string usage_text(bool plugin) {
     option("       --hardcalls", "ignore dosages; use unphased hardcall correlation");
     option("       --missing-ref <string>", "policy for significant variants absent from panel: skip, error [skip]");
     option("       --cache-mb <int>", "decoded reference genotype cache in MiB [512]");
+    option("       --temp-dir <dir>", "temporary reference storage directory [TMPDIR or .]");
     out << "\nLocus definition options:\n";
     option("       --p1 <float>", "significant when GWAS P <= threshold [5e-8]");
     option("       --log10p-threshold <float>", "significant when LP >= threshold; alternative to --p1");
@@ -190,7 +191,7 @@ Options parse(int argc, char** argv, bool plugin) {
         "--pheno", "--p1", "--log10p-threshold", "--p2", "--indep-r2", "--lead-r2",
         "--ld-kb", "--merge-kb", "--distance-kb", "--maf", "--gwas-maf", "--min-call-rate",
         "--min-pair-samples", "--keep", "--gwas-only", "--hardcalls", "--missing-ref",
-        "--cache-mb"
+        "--cache-mb", "--temp-dir"
     };
     auto integer = [](double n, const std::string& name) -> size_t {
         require(n >= 1 && n <= 1000000000 && std::floor(n) == n, "Invalid positive integer for " + name);
@@ -325,6 +326,7 @@ Options parse(int argc, char** argv, bool plugin) {
         else if (a == "--maf") o.maf = number(v,a);
         else if (a == "--gwas-maf") o.gwas_maf = number(v,a);
         else if (a == "--min-call-rate") o.call_rate = number(v,a);
+        else if (a == "--temp-dir") o.temp_dir = v;
         else if (a == "--cache-mb") o.cache_mb = integer(number(v,a),a);
         else if (a == "--min-pair-samples") o.min_pair = integer(number(v,a),a);
         else if (a == "--threads") {
@@ -391,7 +393,7 @@ struct Locus {
     int rid;
     int64_t start, end;
     std::vector<size_t> members;
-    std::set<size_t> candidates;
+    size_t candidates = 0;
 };
 struct Stats {
     size_t scanned = 0, unsupported = 0, invalid_lp = 0, undefined_candidate_ld = 0, filtered = 0;
@@ -403,9 +405,9 @@ struct Analysis {
     std::vector<Signal> signals;
     std::vector<Exclusion> excluded;
     std::vector<Independent> independent;
-    std::vector<Association> associations;
+    std::string associations;
     std::vector<Locus> loci;
-    std::vector<float> reference_lp;
+    size_t reference_phenotype = 0;
     const Signal& index_signal(const Locus& locus) const {
         // Locus members retain the significance ordering of the signals.
         return signals[independent[locus.members.front()].signal];
@@ -530,10 +532,7 @@ void tag_reference(const Options& o, std::vector<Analysis>& analyses, Reference&
     auto filter = make_gwas_filter(o,in.header);
     const auto filter_ids = gwas_filter_ids(o,in.header);
     std::vector<int> samples;
-    for (auto& a : analyses) {
-        samples.push_back(a.sample_index);
-        a.reference_lp.assign(ref.variants.size(),std::numeric_limits<float>::quiet_NaN());
-    }
+    for (auto& a : analyses) samples.push_back(a.sample_index);
     std::vector<double> lp;
     while (auto* r = in.next()) {
         const bool eligible = r->n_allele == 2 && passes_filter(o,filter.get(),filter_ids,r);
@@ -542,35 +541,40 @@ void tag_reference(const Options& o, std::vector<Analysis>& analyses, Reference&
         // so they cannot re-enter as reference-only candidates.
         for (int alt = 1; alt < r->n_allele; ++alt) {
             if (!sequence(r->d.allele[0]) || !sequence(r->d.allele[alt])) continue;
-            auto k = key(bcf_hdr_id2name(in.header,r->rid),r->pos+1,r->d.allele[0],r->d.allele[alt]);
-            auto found = ref.lookup.find(k);
-            if (found == ref.lookup.end()) continue;
-            auto& v = ref.variants[found->second];
-            require(!v.tagged,"Duplicate GWAS allele pair in reference window: " + k);
-            v.tagged = true;
+            auto chr = chromosome(bcf_hdr_id2name(in.header,r->rid));
+            auto k = key(chr,r->pos+1,r->d.allele[0],r->d.allele[alt]);
+            auto found = ref.store.find(chr,r->pos+1,k);
+            if (!found) continue;
+            ref.store.tag(*found,k);
             if (eligible) {
                 if (!decoded) { in.scalars(r,"LP",samples,lp); decoded = true; }
-                for (size_t i = 0; i < analyses.size(); ++i) analyses[i].reference_lp[found->second] = lp[i];
+                ref.store.set_lp(*found,lp);
             }
         }
     }
+    ref.store.finish_tagging();
 }
 DisjointSet find_ld(const Options& o, Analysis& analysis, Reference& ref) {
     auto& signals = analysis.signals;
     auto& independent = analysis.independent;
+    std::unique_ptr<BinaryFile> associations;
+    if (!o.out.empty()) {
+        analysis.associations = ref.scratch.file();
+        associations = std::make_unique<BinaryFile>(analysis.associations,"wb");
+    }
     const float candidate_threshold = static_cast<float>(-std::log10(o.p2));
     require(ref.subset.size() >= o.min_pair, "Reference subset smaller than --min-pair-samples");
     // First-stage clumping retains independent significant variants.
     Nearby chosen;
     for (size_t i = 0; i < signals.size(); ++i) {
         auto& s = signals[i];
-        auto hit = ref.lookup.find(s.key);
-        if (hit == ref.lookup.end()) {
+        auto hit = ref.store.find(s.chr,s.pos,s.key);
+        if (!hit) {
             require(o.missing != "error", "Significant variant missing from reference: " + s.key);
             analysis.excluded.push_back({s.key,s.id,"missing_reference",s.lp}); continue;
         }
-        s.reference = hit->second;
-        if (!ref.passes(s.reference, o.maf, o.call_rate)) {
+        s.reference = *hit;
+        if (!ref.passes(s.reference)) {
             analysis.excluded.push_back({s.key,s.id,"reference_maf_callrate_or_variance",s.lp}); continue;
         }
         auto g = ref.genotype(s.reference);
@@ -608,17 +612,18 @@ DisjointSet find_ld(const Options& o, Analysis& analysis, Reference& ref) {
         });
         if (owner != none) { a.is_lead = false; a.lead = owner; }
         previous[s.chr].emplace(s.pos,i);
-        ref.neighborhood(s.reference, o.ld_bp, [&](size_t j) {
-            const auto& v = ref.variants[j];
+        ref.store.neighborhood(s.chr, s.pos, o.ld_bp, [&](const RefVariant& v) {
+            size_t j = v.index;
             if (j != s.reference) {
-                if (v.tagged && !(analysis.reference_lp[j] > candidate_threshold)) return;
-                if (!v.tagged && o.gwas_only) return;
-                if (!ref.passes(j,o.maf,o.call_rate)) return;
+                const bool tagged = ref.store.tagged(j);
+                if (tagged && !(ref.store.lp(j,analysis.reference_phenotype) > candidate_threshold)) return;
+                if (!tagged && o.gwas_only) return;
+                if (!ref.passes(j)) return;
             }
             double r2 = j == s.reference ? 1 : r_squared(*g,*ref.genotype(j),o.min_pair);
             if (!std::isfinite(r2)) { ++analysis.stats.undefined_candidate_ld; return; }
             if (r2 >= o.indep_r2) {
-                analysis.associations.push_back({i,j,r2});
+                if (associations) associations->write(Association{i,j,r2});
                 a.start = std::min(a.start,v.pos); a.end = std::max(a.end,v.pos);
             }
         });
@@ -636,6 +641,7 @@ DisjointSet find_ld(const Options& o, Analysis& analysis, Reference& ref) {
     std::vector<Interval> intervals;
     for (const auto& item : spans) intervals.push_back(item.second);
     merge_intervals(std::move(intervals),o.merge_bp,components);
+    if (associations) associations->close();
     return components;
 }
 DisjointSet find_distance(const Options& o, Analysis& analysis) {
@@ -650,7 +656,7 @@ DisjointSet find_distance(const Options& o, Analysis& analysis) {
     return components;
 }
 std::vector<Locus> collect_loci(const std::vector<Signal>& signals, std::vector<Independent>& independent,
-                                const std::vector<Association>& associations, DisjointSet& dsu) {
+                                DisjointSet& dsu) {
     std::map<size_t,Locus> grouped;
     for (size_t i = 0; i < independent.size(); ++i) {
         const auto& a = independent[i];
@@ -669,8 +675,29 @@ std::vector<Locus> collect_loci(const std::vector<Signal>& signals, std::vector<
     });
     for (size_t i = 0; i < out.size(); ++i)
         for (size_t j : out[i].members) independent[j].locus = i+1;
-    for (const auto& a : associations) out[independent[a.independent].locus-1].candidates.insert(a.reference);
     return out;
+}
+// Candidate edges are only retained when reports were requested. Sorting
+// (final locus, reference ID) counts unique variants without large locus sets.
+struct LocusCandidate {
+    size_t locus = 0, reference = 0;
+    bool operator<(const LocusCandidate& b) const { return std::tie(locus,reference) < std::tie(b.locus,b.reference); }
+    bool read(BinaryFile& file) { return file.read(*this); }
+    void write(BinaryFile& file) const { file.write(*this); }
+    size_t memory_bytes() const { return sizeof(*this); }
+};
+void count_candidates(Analysis& analysis, ScratchDirectory& scratch) {
+    if (analysis.associations.empty()) return;
+    ExternalSort<LocusCandidate> sorter(scratch);
+    BinaryFile associations(analysis.associations,"rb");
+    Association edge{};
+    while (associations.read(edge))
+        sorter.add({analysis.independent[edge.independent].locus,edge.reference});
+    std::optional<LocusCandidate> previous;
+    sorter.finish([&](const LocusCandidate& value) {
+        if (!previous || *previous < value) ++analysis.loci[value.locus-1].candidates;
+        previous = value;
+    });
 }
 // Output files and both possible index sidecars must have distinct paths.
 // Resolve aliases so one output cannot replace another output or an input.
@@ -890,7 +917,7 @@ void write_outputs(ReportOutputs& reports, const Options& o, bcf_hdr_t* header,
             for (auto j : loc.members) leads += a.independent[j].is_lead;
             out << a.sample << '\t' << i+1 << '\t' << loc.chr << '\t' << loc.start << '\t' << loc.end << '\t'
                 << s.key << '\t' << s.id << '\t' << s.pos << '\t' << s.lp << '\t';
-            if (ref) out << loc.members.size() << '\t' << leads << '\t' << loc.candidates.size();
+            if (ref) out << loc.members.size() << '\t' << leads << '\t' << loc.candidates;
             else out << ".\t.\t.";
             out << '\t' << method << '\n';
         }
@@ -914,14 +941,21 @@ void write_outputs(ReportOutputs& reports, const Options& o, bcf_hdr_t* header,
     {
         auto out = reports.stream(".candidates.tsv");
         out << "SAMPLE\tLOCUS\tINDEPENDENT_KEY\tKEY\tID\tCHROM\tPOS\tREF\tALT\tR2\tMAF\tCALL_RATE\tGWAS_LP\tSOURCE\n";
-        if (ref) for (const auto& a : analyses) for (const auto& b : a.associations) {
-            const auto& v = ref->variants[b.reference];
-            out << a.sample << '\t' << a.independent[b.independent].locus << '\t' << a.signals[a.independent[b.independent].signal].key << '\t'
-                << v.key << '\t' << v.id << '\t' << v.chr << '\t' << v.pos << '\t' << v.ref << '\t' << v.alt << '\t'
-                << b.r2 << '\t' << v.maf << '\t' << v.call_rate << '\t';
-            float lp = a.reference_lp[b.reference];
-            if (std::isnan(lp)) out << '.'; else out << lp;
-            out << '\t' << (v.tagged ? "gwas" : "reference_only") << '\n';
+        if (ref) for (const auto& a : analyses) {
+            if (a.associations.empty()) continue;
+            BinaryFile associations(a.associations,"rb");
+            Association b{};
+            while (associations.read(b)) {
+                const auto v = ref->store.get(b.reference);
+                auto qc = ref->store.qc(b.reference);
+                require(qc.has_value(),"Missing candidate QC");
+                out << a.sample << '\t' << a.independent[b.independent].locus << '\t' << a.signals[a.independent[b.independent].signal].key << '\t'
+                    << v.key << '\t' << v.id << '\t' << v.chr << '\t' << v.pos << '\t' << v.ref << '\t' << v.alt << '\t'
+                    << b.r2 << '\t' << qc->maf << '\t' << qc->call_rate << '\t';
+                float lp = ref->store.lp(b.reference,a.reference_phenotype);
+                if (std::isnan(lp)) out << '.'; else out << lp;
+                out << '\t' << (ref->store.tagged(b.reference) ? "gwas" : "reference_only") << '\n';
+            }
         }
         out.close();
     }
@@ -958,6 +992,7 @@ void write_outputs(ReportOutputs& reports, const Options& o, bcf_hdr_t* header,
             << "\nmin_pair_samples\t" << o.min_pair << "\nkeep\t" << o.keep
             << "\nld_measure\t" << (o.hardcalls ? "unphased_hardcall_r2" : "unphased_dosage_r2")
             << "\ninclude_reference_only\t" << !o.gwas_only << "\nmissing_reference_policy\t" << o.missing
+            << "\nreference_storage\t" << (ref ? "temporary_binary" : ".") << "\ntemp_dir\t" << o.temp_dir
             << "\ncache_mb\t" << o.cache_mb << "\nhts_threads\t" << o.threads << "\nhtslib_version\t" << hts_version()
             << "\npgen_support\t" << LF_WITH_PGEN
             << "\npgenlib_revision\t" << (LF_WITH_PGEN ? "4544f92e374e784a6ffd97fa88239962b81f2b62" : ".")
@@ -967,7 +1002,11 @@ void write_outputs(ReportOutputs& reports, const Options& o, bcf_hdr_t* header,
             << "\nundefined_candidate_ld\t" << stats.undefined_candidate_ld << "\nelapsed_seconds\t" << elapsed << '\n';
         if (ref) {
             out << "reference_backend\t" << (o.vcf_refs.empty() ? "pgen" : "vcf") << "\nreference_samples\t" << ref->subset.size()
-                << "\nreference_variants_in_windows\t" << ref->variants.size() << "\nreference_duplicates_skipped\t" << ref->duplicates_skipped
+                << "\nreference_variants_in_windows\t" << ref->store.size() << "\nreference_duplicates_skipped\t" << ref->duplicates_skipped
+                << "\nreference_variants_qc_evaluated\t" << ref->qc_counts.evaluated
+                << "\nreference_variants_qc_passed\t" << ref->qc_counts.passed
+                << "\nreference_variants_qc_filtered\t" << ref->qc_counts.filtered()
+                << "\nreference_variants_qc_not_evaluated\t" << ref->qc_not_evaluated()
                 << "\nreference_multiallelic_skipped\t" << ref->multiallelic_skipped << "\ngenotype_reads\t" << ref->genotype_reads
                 << "\nindependent_variants\t" << n_independent << '\n';
             for (const auto& shard : ref->shards) out << "reference_prefix\t" << shard->prefix << '\n';
@@ -999,6 +1038,7 @@ int run(int argc, char** argv, bool plugin, FilterFactory filters) {
     for (const auto& output : o.outputs) outputs.emplace_back(output.second,o.write_index,output.first,paths);
     Header header;
     Stats stats;
+    std::unique_ptr<Reference> ref;
     auto analyses = read_signals(o,header,stats);
     std::cerr << "Read " << stats.scanned << " records; analyzing " << analyses.size() << " GWAS phenotypes\n";
     Windows windows;
@@ -1007,22 +1047,29 @@ int run(int argc, char** argv, bool plugin, FilterFactory filters) {
         std::sort(item.second.begin(),item.second.end());
         item.second.erase(std::unique(item.second.begin(),item.second.end()),item.second.end());
     }
-    std::unique_ptr<Reference> ref;
     if (o.has_reference() && (!windows.empty() || !o.vcf_refs.empty())) {
-        ref = std::make_unique<Reference>(o.vcf_refs.empty() ? o.prefixes : o.vcf_refs,windows,o.ld_bp,o.keep,o.cache_mb,o.hardcalls,!o.vcf_refs.empty(),o.threads);
+        ref = std::make_unique<Reference>(o.vcf_refs.empty() ? o.prefixes : o.vcf_refs,windows,o.ld_bp,o.keep,o.cache_mb,o.hardcalls,!o.vcf_refs.empty(),o.threads,o.temp_dir,analyses.size(),ReferenceFilters{o.maf,o.call_rate});
         if (ref->duplicates_skipped)
             std::cerr << "Warning: Skipped " << ref->duplicates_skipped
                       << " duplicate reference rows in queried windows; kept the first occurrence of each allele-pair key"
                       << " (showing at most 10 duplicate details).\n";
-        std::cerr << "Reference: " << ref->variants.size() << " nearby variants, " << ref->subset.size() << " selected samples\n";
+        std::cerr << "Reference: " << ref->store.size() << " nearby variants before reference QC, " << ref->subset.size() << " selected samples\n";
         if (!windows.empty()) tag_reference(o,analyses,*ref);
     }
-    for (auto& a : analyses) {
+    for (size_t phenotype = 0; phenotype < analyses.size(); ++phenotype) {
+        auto& a = analyses[phenotype];
+        a.reference_phenotype = phenotype;
         auto components = ref ? find_ld(o,a,*ref) : find_distance(o,a);
-        a.loci = collect_loci(a.signals,a.independent,a.associations,components);
+        a.loci = collect_loci(a.signals,a.independent,components);
+        if (ref) count_candidates(a,ref->scratch);
         stats.invalid_lp += a.stats.invalid_lp;
         stats.undefined_candidate_ld += a.stats.undefined_candidate_ld;
         std::cerr << a.sample << ": " << a.loci.size() << " loci; " << a.excluded.size() << " excluded significant variants\n";
+    }
+    if (ref) {
+        const auto& qc = ref->qc_counts;
+        std::cerr << "Reference QC: " << qc.evaluated << " variants evaluated, " << qc.passed
+                  << " passed, " << qc.filtered() << " filtered out; " << ref->qc_not_evaluated() << " not evaluated (genotypes not needed)\n";
     }
     double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     if (reports) reports->begin_write();

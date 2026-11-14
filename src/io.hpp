@@ -116,12 +116,13 @@ public:
     bcf_hdr_t* header = nullptr;
     IndexedReader(const std::string& path, const std::string& region, int threads,
                   bool regions_file = false, int regions_overlap = 0,
-                  const std::string& targets = "", bool targets_file = false, int targets_overlap = 0) : path_(path) {
+                  const std::string& targets = "", bool targets_file = false, int targets_overlap = 0, int max_unpack = 0) : path_(path) {
         require(path != "-" && fs::is_regular_file(path),
                 "Input must be an indexed, rereadable local VCF/BCF file: " + path);
         sr_ = bcf_sr_init();
         require(sr_, "Cannot allocate HTSlib reader");
         try {
+            sr_->max_unpack = max_unpack;
             bcf_sr_set_opt(sr_, BCF_SR_REQUIRE_IDX);
             bcf_sr_set_opt(sr_, BCF_SR_REGIONS_OVERLAP, regions_overlap);
             bcf_sr_set_opt(sr_, BCF_SR_TARGETS_OVERLAP, targets_overlap);
@@ -142,7 +143,7 @@ public:
         reset_order();
     }
     void seek(const std::string& chr, int64_t pos) {
-        require(bcf_sr_seek(sr_,chr.c_str(),pos-1) == 0,
+        require(bcf_sr_seek(sr_,chr.c_str(),pos-1) == 0 && !sr_->errnum,
                 "Cannot seek reference " + path_ + " at " + chr + ":" + std::to_string(pos));
         reset_order();
     }

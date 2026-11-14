@@ -1,5 +1,5 @@
 #pragma once
-#include "io.hpp"
+#include "storage.hpp"
 #ifndef LF_WITH_PGEN
 #define LF_WITH_PGEN 1
 #endif
@@ -26,15 +26,6 @@ struct AlignedBuffer {
     template<class T> T* as() { return static_cast<T*>(ptr); }
 };
 #endif
-struct RefVariant {
-    std::string chr, id, ref, alt, key;
-    int64_t pos = 0;
-    size_t shard = 0;
-    uint32_t row = 0;
-    bool tagged = false, qc_done = false;
-    double maf = 0, call_rate = 0;
-    double variance = 0;
-};
 using Windows = std::map<std::string, std::vector<int64_t>>;
 inline bool near_signal(const Windows& windows, const std::string& chr, int64_t pos, int64_t radius) {
     auto found = windows.find(chr);
@@ -106,7 +97,7 @@ struct GenotypeSource {
     std::string prefix;
     uint32_t samples = 0;
     virtual ~GenotypeSource() = default;
-    virtual std::vector<float> read(uint32_t row, const std::vector<uint32_t>& subset, bool hardcalls) = 0;
+    virtual std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) = 0;
 };
 #if LF_WITH_PGEN
 struct PgenSource : GenotypeSource {
@@ -160,8 +151,9 @@ struct PgenSource : GenotypeSource {
         dosage_main.allocate(((static_cast<size_t>(samples)*2+63)/64)*64);
         opened = true;
     }
-    std::vector<float> read(uint32_t row, const std::vector<uint32_t>& subset, bool hardcalls) override {
+    std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) override {
         open();
+        const uint32_t row = variant.row;
         using namespace plink2;
         PgrSampleSubsetIndex pssi;
         PgrClearSampleSubsetIndex(nullptr, &pssi);
@@ -189,8 +181,9 @@ struct PgenSource : GenotypeSource {
 // Reference VCF records are located through their index on cache misses.
 // Metadata contains only variants in the signal windows, never full GT arrays.
 struct VcfSource : GenotypeSource {
-    struct Location { std::string chr, key; int64_t pos; };
-    std::vector<Location> locations;
+    int cursor_rid = -1;
+    int64_t cursor_pos = -1, cursor_window_end = -1;
+    std::map<int,std::vector<std::pair<int64_t,int64_t>>> windows;
     std::unique_ptr<IndexedReader> reader;
     float* ds = nullptr;
     int ds_capacity = 0;
@@ -205,16 +198,33 @@ struct VcfSource : GenotypeSource {
         require(samples > 0, "Reference VCF/BCF has no samples: " + path);
     }
     ~VcfSource() override { free(ds); free(hds); free(gt); }
-    std::vector<float> read(uint32_t row, const std::vector<uint32_t>& subset, bool hardcalls) override {
-        const auto& loc = locations.at(row);
-        reader->seek(loc.chr,loc.pos);
-        bcf1_t* rec = nullptr;
-        while (auto* r = reader->next()) {
-            if (r->pos+1 > loc.pos || loc.chr != bcf_hdr_id2name(reader->header,r->rid)) break;
-            if (r->pos+1 == loc.pos && r->n_allele == 2 &&
-                key(loc.chr,loc.pos,r->d.allele[0],r->d.allele[1]) == loc.key) { rec = r; break; }
-        }
+    std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) override {
+        const auto& loc = variant;
+        const char* raw_chr = bcf_hdr_id2name(reader->header,loc.row);
+        require(raw_chr,"Invalid reference VCF contig ID");
+        // Nearby, strictly forward requests can share decompression work.
+        // Equal-position requests seek again: key order may differ from file
+        // order, and the first duplicate must always win.
+        const bool forward = cursor_rid == static_cast<int>(loc.row) &&
+            loc.pos > cursor_pos && loc.pos <= cursor_window_end && loc.pos-cursor_pos <= 65536;
+        auto find = [&](size_t budget) -> bcf1_t* {
+            while (budget--) {
+                auto* r = reader->next();
+                if (!r || r->rid != static_cast<int>(loc.row) || r->pos+1 > loc.pos) break;
+                if (r->pos+1 == loc.pos && r->n_allele == 2 &&
+                    key(raw_chr,loc.pos,r->d.allele[0],r->d.allele[1]) == loc.key) return r;
+            }
+            return nullptr;
+        };
+        bcf1_t* rec = forward ? find(256) : nullptr;
+        if (!rec) { reader->seek(raw_chr,loc.pos); rec = find(SIZE_MAX); }
         require(rec, "Reference record unavailable after indexed seek (check index): " + loc.key);
+        cursor_rid = loc.row; cursor_pos = loc.pos;
+        const auto& intervals = windows.at(loc.row);
+        auto interval = std::upper_bound(intervals.begin(),intervals.end(),loc.pos,
+                                         [](int64_t pos,const auto& span) { return pos < span.first; });
+        require(interval != intervals.begin() && loc.pos <= std::prev(interval)->second,"Reference outside signal windows");
+        cursor_window_end = std::prev(interval)->second;
         int nds = -1, nhds = -1, ngt = bcf_get_genotypes(reader->header,rec,&gt,&gt_capacity);
         if (!hardcalls) {
             int id = bcf_hdr_id2int(reader->header,BCF_DT_ID,"DS");
@@ -304,6 +314,16 @@ inline std::string reference_regions(bcf_hdr_t* hdr, const Windows& windows, int
     free(names);
     return out.str();
 }
+struct ReferenceFilters {
+    double maf = 0, call_rate = 0;
+    bool passes(const RefQC& qc) const {
+        return qc.maf > 0 && qc.maf >= maf && qc.call_rate >= call_rate && qc.variance > 0;
+    }
+};
+struct ReferenceQCCounts {
+    size_t evaluated = 0, passed = 0;
+    size_t filtered() const { return evaluated-passed; }
+};
 class Reference {
     std::list<size_t> lru_;
     struct CacheEntry {
@@ -313,15 +333,18 @@ class Reference {
     std::unordered_map<size_t, CacheEntry> cache_;
     size_t cache_limit_;
     bool hardcalls_;
+    ReferenceFilters filters_;
 public:
     std::vector<std::unique_ptr<GenotypeSource>> shards;
-    std::vector<RefVariant> variants;
-    std::unordered_map<std::string, size_t> lookup;
-    std::map<std::string, std::vector<size_t>> by_chr;
+    ScratchDirectory scratch;
+    ReferenceStore store;
     std::vector<uint32_t> subset;
     size_t multiallelic_skipped = 0, duplicates_skipped = 0, genotype_reads = 0;
+    ReferenceQCCounts qc_counts;
     Reference(const std::vector<std::string>& prefixes, const Windows& windows, int64_t radius,
-              const std::string& keep, size_t cache_mb, bool hardcalls, bool vcf_input = false, int threads = 1) : cache_limit_(0), hardcalls_(hardcalls) {
+              const std::string& keep, size_t cache_mb, bool hardcalls, bool vcf_input = false, int threads = 1,
+              const std::string& temp_dir = "", size_t phenotypes = 1, ReferenceFilters filters = {})
+        : cache_limit_(0), hardcalls_(hardcalls), filters_(filters), scratch(temp_dir), store(scratch,phenotypes) {
         std::vector<std::pair<std::string, std::string>> samples;
         std::set<std::string> unique_prefixes;
         for (auto prefix : prefixes) {
@@ -362,8 +385,16 @@ public:
         }
         require(subset.size() >= 3, "Reference sample subset needs at least 3 samples");
         cache_limit_ = std::max<size_t>(1, cache_mb*1024*1024/(subset.size()*sizeof(float)));
-        for (auto& entry : by_chr) std::sort(entry.second.begin(), entry.second.end(), [&](size_t a, size_t b) {
-            return std::tie(variants[a].pos, variants[a].key) < std::tie(variants[b].pos, variants[b].key);
+        store.build([&](const RefVariant& first, const RefVariant& duplicate) {
+            ++duplicates_skipped;
+            if (duplicates_skipped <= 10) {
+                std::cerr << "Warning: Duplicate/overlapping reference variant: " << duplicate.key
+                          << "; keeping first occurrence (" << shards[first.shard]->prefix;
+                if (!vcf_input) std::cerr << ", variant row " << first.row+1;
+                std::cerr << "), skipping " << shards[duplicate.shard]->prefix;
+                if (!vcf_input) std::cerr << ", variant row " << duplicate.row+1;
+                std::cerr << '\n';
+            }
         });
     }
     std::shared_ptr<std::vector<float>> genotype(size_t i) {
@@ -372,50 +403,54 @@ public:
             lru_.splice(lru_.begin(), lru_, hit->second.position);
             return hit->second.data;
         }
-        auto& v = variants[i];
-        auto data = std::make_shared<std::vector<float>>(shards[v.shard]->read(v.row, subset, hardcalls_));
+        const auto v = store.get(i);
+        auto data = std::make_shared<std::vector<float>>(shards[v.shard]->read(v, subset, hardcalls_));
         ++genotype_reads;
-        if (!v.qc_done) {
+        if (!store.qc(i)) {
             double sum = 0, ss = 0;
             size_t n = 0;
             for (float x : *data) if (x >= 0) { sum += x; ++n; }
             double mean = n ? sum/n : 0;
             for (float x : *data) if (x >= 0) ss += (x-mean)*(x-mean);
-            v.maf = n ? std::min(mean/2, 1-mean/2) : 0;
-            v.call_rate = static_cast<double>(n)/data->size();
-            v.variance = ss;
-            v.qc_done = true;
+            const RefQC qc{n ? std::min(mean/2, 1-mean/2) : 0, static_cast<double>(n)/data->size(), ss};
+            store.set_qc(i,qc);
+            // Persisted QC marks each variant once across cache evictions,
+            // repeated LD windows, overlapping shards, and phenotypes.
+            ++qc_counts.evaluated;
+            qc_counts.passed += filters_.passes(qc);
         }
         while (cache_.size() >= cache_limit_) { cache_.erase(lru_.back()); lru_.pop_back(); }
         lru_.push_front(i);
         cache_[i] = {data, lru_.begin()};
         return data;
     }
-    bool passes(size_t i, double maf, double call_rate) {
-        if (!variants[i].qc_done) genotype(i);
-        const auto& v = variants[i];
-        return v.maf > 0 && v.maf >= maf && v.call_rate >= call_rate && v.variance > 0;
-    }
-    template<class F> void neighborhood(size_t i, int64_t radius, F visit) {
-        const auto& v = variants[i];
-        const auto& ids = by_chr.at(v.chr);
-        auto it = std::lower_bound(ids.begin(), ids.end(), v.pos-radius,
-                                  [&](size_t j, int64_t pos) { return variants[j].pos < pos; });
-        for (; it != ids.end() && variants[*it].pos <= v.pos+radius; ++it) visit(*it);
+    size_t qc_not_evaluated() const { return store.size()-qc_counts.evaluated; }
+    bool passes(size_t i) {
+        auto qc = store.qc(i);
+        if (!qc) { genotype(i); qc = store.qc(i); }
+        require(qc.has_value(),"Missing reference QC");
+        return filters_.passes(*qc);
     }
 private:
     void add_variant(RefVariant variant) {
-        const size_t index = variants.size();
         variant.shard = shards.size();
-        lookup.emplace(variant.key,index);
-        by_chr[variant.chr].push_back(index);
-        variants.push_back(std::move(variant));
+        store.add(std::move(variant));
     }
     void load_vcf_variants(VcfSource& shard, const Windows& windows, int64_t radius, int threads) {
         const auto& prefix = shard.prefix;
         const auto regions = reference_regions(shard.reader->header,windows,radius);
         if (regions.empty()) return;
-        IndexedReader scan(prefix,regions,threads);
+        for (int rid = 0; rid < shard.reader->header->n[BCF_DT_CTG]; ++rid) {
+            auto found = windows.find(chromosome(bcf_hdr_id2name(shard.reader->header,rid)));
+            if (found == windows.end()) continue;
+            auto& intervals = shard.windows[rid];
+            for (auto pos : found->second) {
+                const int64_t start = std::max<int64_t>(1,pos-radius), end = pos+radius;
+                if (!intervals.empty() && start <= intervals.back().second+1) intervals.back().second = end;
+                else intervals.emplace_back(start,end);
+            }
+        }
+        IndexedReader scan(prefix,regions,threads,false,0,"",false,0,BCF_UN_INFO);
         while (auto* r = scan.next()) {
             if (r->n_allele != 2) { ++multiallelic_skipped; continue; }
             if (!sequence(r->d.allele[0]) || !sequence(r->d.allele[1])) continue;
@@ -423,19 +458,10 @@ private:
             auto chr = chromosome(raw_chr);
             if (!near_signal(windows,chr,r->pos+1,radius)) continue;
             auto k = key(chr,r->pos+1,r->d.allele[0],r->d.allele[1]);
-            if (lookup.count(k)) {
-                ++duplicates_skipped;
-                if (duplicates_skipped <= 10)
-                    std::cerr << "Warning: Duplicate/overlapping reference variant: " << k
-                              << "; keeping first occurrence, skipping " << prefix << '\n';
-                continue;
-            }
-            require(shard.locations.size() < UINT32_MAX,"Too many reference variants in windows");
             RefVariant v;
             v.chr = chr; v.pos = r->pos+1; v.id = r->d.id;
             v.ref = r->d.allele[0]; v.alt = r->d.allele[1]; v.key = k;
-            v.row = shard.locations.size();
-            shard.locations.push_back({raw_chr,k,v.pos});
+            v.row = r->rid;
             add_variant(std::move(v));
         }
     }
@@ -479,20 +505,6 @@ private:
             require(parsed == f[1].size() && pos > 0 && pos < INT64_MAX/2, "Invalid PVAR position");
             if (!near_signal(windows, chr, pos, radius) || !sequence(f[3]) || !sequence(f[4])) continue;
             auto k = key(chr, pos, f[3], f[4]);
-            auto duplicate = lookup.find(k);
-            if (duplicate != lookup.end()) {
-                ++duplicates_skipped;
-                if (duplicates_skipped <= 10) {
-                    const auto& first = variants[duplicate->second];
-                    const auto& first_prefix = first.shard == shards.size() ? prefix : shards[first.shard]->prefix;
-                    std::cerr << "Warning: Duplicate/overlapping reference variant: " << k
-                              << "; keeping first occurrence (" << first_prefix << ", variant row " << first.row+1
-                              << "), skipping " << prefix << ", variant row " << row+1 << '\n';
-                }
-                // raw_count and allele offsets already include this row:
-                // subsequent metadata must still address the original PGEN.
-                continue;
-            }
             RefVariant v;
             v.chr = chr; v.id = f[2]; v.ref = f[3]; v.alt = f[4]; v.key = k;
             v.pos = pos; v.row = row;
