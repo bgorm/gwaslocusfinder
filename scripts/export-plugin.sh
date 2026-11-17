@@ -13,7 +13,8 @@ cd "$(dirname "$0")/.."
 files=(
     README.md LICENSE THIRD_PARTY.md Makefile .gitignore
     src/core.hpp src/io.hpp src/storage.hpp src/reference.hpp src/entry.hpp src/engine.cpp src/plugin.cpp
-    scripts/bootstrap.sh scripts/export-plugin.sh
+    scripts/bootstrap.sh scripts/export-plugin.sh scripts/benchmark.py benchmarks/README.md
+    tests/fixtures/README.md tests/fixtures/panel.vcf tests/fixtures/panel.pgen tests/fixtures/panel.pvar tests/fixtures/panel.psam
     tests/test_plugin.py tests/test_storage.cpp .github/workflows/build.yml
 )
 for file in "${files[@]}"; do

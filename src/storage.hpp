@@ -296,6 +296,17 @@ public:
     }
     size_t size() const { return count_; }
     RefVariant get(size_t id) { require(id < count_,"Invalid reference ID"); return block(id/block_size)->variants[id%block_size]; }
+    bool overlaps(const std::string& chr, int64_t start, int64_t end) {
+        const auto lower = std::tie(chr,start);
+        auto before = [](const auto& row, const auto& key) { return std::tie(row.chr,row.pos) < key; };
+        auto next = std::lower_bound(index_.begin(),index_.end(),lower,before);
+        if (next != index_.end() && next->chr == chr && next->pos <= end) return true;
+        if (next == index_.begin()) return false;
+        // Only the block immediately before the lower bound can straddle it.
+        auto page = block(static_cast<size_t>(next-index_.begin()-1));
+        auto row = std::lower_bound(page->variants.begin(),page->variants.end(),lower,before);
+        return row != page->variants.end() && row->chr == chr && row->pos <= end;
+    }
     std::optional<size_t> find(const std::string& chr, int64_t pos, const std::string& key) {
         if (index_.empty()) return {};
         auto values = block(locate(chr,pos,key));

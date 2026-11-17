@@ -1,4 +1,4 @@
-"""Public plugin checks: no standalone executable, PLINK, or PGEN files required."""
+"""Public plugin checks: requires bcftools and the plugin; the synthetic PGEN is included."""
 import csv
 import os
 from pathlib import Path
@@ -23,6 +23,10 @@ def command(args, ok=True):
 
 @unittest.skipUnless(BCFTOOLS and PLUGIN.is_file(), "bcftools and built plugin required")
 class PublicPluginTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.supports_pgen = "--pfile <prefix>" in command([BCFTOOLS, "+" + str(PLUGIN), "--help"]).stderr
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -265,12 +269,195 @@ class PublicPluginTests(unittest.TestCase):
         _, _, result = self.run_plugin("missing-scratch", specific=["--temp-dir", scratch / "absent"], ok=False)
         self.assertIn("Cannot create temporary directory", result.stderr)
 
+    def test_auxiliary_input_collisions_preserve_files(self):
+        panel = ROOT / "tests/fixtures/panel"
+        # Exercise primary outputs, optional streams, removed indexes, and reports.
+        cases = [
+            ("ids.list", "x\n", ["-i", "ID=@{file}"], [], "index"),
+            ("filter samples.txt", "A\n", ["-e", "FMT/LP[@{file}:0]>100"], [], "index"),
+            ("keep.txt", "s0\ns1\ns2\n", [], ["--keep", "{file}"], "index"),
+            ("samples.txt", "A\n", ["-S", "{file}"], [], "index"),
+            ("samples.tbi", "A\n", ["--samples-file", "^{file}"], [], "tbi"),
+            ("result.run.tsv", "1\t1000\t1000\n", ["-R", "{file}"], [], "report"),
+            ("regions.txt", "1\t1000\t1000\n", ["-R", "{file}"], [], "leads"),
+            ("targets.txt", "1\t1000\t1000\n", ["-T", "{file}"], [], "index"),
+            ("targets.csi", "1\t1500\t1600\n", ["--targets-file", "^{file}"], [], "csi"),
+            ("refs.list", str(self.ref) + "\n", [], ["--vcf-ref-list", "{file}"], "leads"),
+        ]
+        if self.supports_pgen:
+            cases.append(("pgen.list", str(panel) + "\n", [], ["--pfile-list", "{file}"], "index"))
+        for name, original, general, specific, kind in cases:
+            with self.subTest(file=name):
+                source = self.d / name
+                source.write_text(original)
+                fmt = lambda args: [arg.format(file=source) for arg in args]
+                prefix = self.d / "result"
+                output = self.d / "index.bcf"
+                output.write_bytes(b"previous index output")
+                args = fmt(specific)
+                if "--pfile-list" not in args and "--vcf-ref-list" not in args:
+                    args += ["--vcf-ref", self.ref]
+                if kind == "leads":
+                    alias = self.d / (name + ".alias")
+                    os.link(source, alias)
+                    args += ["--leads", alias]
+                elif kind in ("csi", "tbi"):
+                    args += ["--independent", source.with_suffix("")]
+                elif kind == "index":
+                    output = source
+                res = command([BCFTOOLS, "+" + str(PLUGIN), "-Ov", "-o", output, *fmt(general),
+                               self.gwas, "--", *args, "--reports-prefix", prefix], ok=False)
+                self.assertIn("collides with input", res.stderr)
+                self.assertEqual(source.read_text(), original)
+                if kind != "index":
+                    self.assertEqual(output.read_bytes(), b"previous index output")
+
+    def test_explicit_output_index_cannot_alias_input(self):
+        keep = self.d / "selected.txt"
+        keep.write_text("s0\ns1\ns2\n")
+        before = keep.read_bytes()
+        output = self.d / "main.bcf"
+        output.write_bytes(b"previous variant output")
+        ambiguous = f"{keep}##idx##custom.csi"
+        for primary, optional in [(ambiguous, []), (output, ["--leads", ambiguous])]:
+            with self.subTest(output=primary):
+                result = command([BCFTOOLS, "+" + str(PLUGIN), "-Ob", "-W", "-o", primary, self.gwas,
+                                  "--", "--vcf-ref", self.ref, "--keep", keep, *optional], ok=False)
+                self.assertIn("##idx##", result.stderr)
+                self.assertEqual(keep.read_bytes(), before)
+                self.assertEqual(output.read_bytes(), b"previous variant output")
+
+    def test_index_aliases_and_quoted_filter_literals(self):
+        original_index = Path(str(self.ref) + ".csi")
+        alternate = self.ref.with_suffix(".csi")
+        original_index.rename(alternate)
+        before = alternate.read_bytes()
+        alias = self.d / "alias.bcf"
+        alias.symlink_to(self.ref)
+        result = command([BCFTOOLS, "+" + str(PLUGIN), "-Ov", "-o", alternate, self.gwas,
+                          "--", "--vcf-ref", alias], ok=False)
+        self.assertIn("collides with input", result.stderr)
+        self.assertEqual(alternate.read_bytes(), before)
+        # A quoted @ is part of a literal ID, not a file operand.
+        output = self.d / "literal.vcf"
+        output.touch()
+        command([BCFTOOLS, "+" + str(PLUGIN), "-Ov", "-o", output, "-e",
+                 f'ID="@{output}"', self.gwas])
+        self.assertTrue(self.ids(output))
+
+    def test_conflicting_locus_headers_fail_before_writing(self):
+        template = (self.d / "default.gwas.vcf").read_text()
+        prefix = self.d / "schema"
+        marker = self.d / "schema.run.tsv"
+        output = self.d / "schema.bcf"
+        output.write_bytes(b"previous variant output")
+        marker.write_bytes(b"previous completion marker")
+        for tag, number, datatype in [("LF_LOCUS", "1", "String"), ("LF_START", "2", "Integer"),
+                                      ("LF_END", "A", "Integer"), ("LF_INDEX_POS", ".", "Integer"),
+                                      ("LF_LOCUS", "1", "Float")]:
+            with self.subTest(tag=tag, number=number, datatype=datatype):
+                definition = f'##FORMAT=<ID={tag},Number={number},Type={datatype},Description="Earlier definition">\n'
+                raw = self.d / "conflict.vcf"
+                raw.write_text(template.replace("#CHROM", definition + "#CHROM"))
+                result = command([BCFTOOLS, "+" + str(PLUGIN), "-Ob", "-o", output,
+                                  self.indexed(raw), "--", "--reports-prefix", prefix], ok=False)
+                self.assertIn("FORMAT/" + tag, result.stderr)
+                self.assertIn("Number=1,Type=Integer", result.stderr)
+                self.assertEqual(output.read_bytes(), b"previous variant output")
+                self.assertEqual(marker.read_bytes(), b"previous completion marker")
+
+    def test_compatible_locus_headers_and_same_named_info(self):
+        template = (self.d / "default.gwas.vcf").read_text()
+        raw = self.d / "compatible.vcf"
+        raw.write_text(template.replace("#CHROM", '##INFO=<ID=LF_LOCUS,Number=1,Type=String,Description="Source">\n'
+                                                   '##FORMAT=<ID=LF_LOCUS,Number=1,Type=Integer,Description="Prior run">\n#CHROM')
+                       .replace("\tPASS\t.\tLP\t", "\tPASS\tLF_LOCUS=original\tLP\t"))
+        gwas = self.indexed(raw)
+        for name in ("first", "second"):
+            _, gwas, _ = self.run_plugin(name, gwas=gwas, reference=False, specific=["--distance-kb", "0"])
+            query = command([BCFTOOLS, "query", "-i", "FMT/LF_LOCUS>0", "-f",
+                             "%ID\t%INFO/LF_LOCUS[\t%LF_LOCUS]\n", gwas]).stdout.splitlines()
+            self.assertIn("x\toriginal\t1\t1", query)
+            header = command([BCFTOOLS, "view", "-h", gwas]).stdout
+            self.assertEqual(header.count("##FORMAT=<ID=LF_LOCUS,"), 1)
+            self.assertIn('Type=Integer,Description="Prior run"', header)
+
+    def test_pgen_vcf_parity(self):
+        if not self.supports_pgen:
+            self.skipTest("PGEN decoder disabled in this build")
+        panel = ROOT / "tests/fixtures/panel"
+        bcf = self.indexed(shutil.copyfile(panel.with_suffix(".vcf"), self.d / "panel.vcf"))
+        keep = self.d / "sample.keep"
+        keep.write_text("s8\ns0\ns4\ns2\ns6\ns3\n")
+        for hardcalls in (False, True):
+            for subset in (False, True):
+                for gwas_only in (False, True):
+                    with self.subTest(hardcalls=hardcalls, subset=subset, gwas_only=gwas_only):
+                        options = []
+                        if hardcalls:
+                            options += ["--hardcalls"]
+                        if subset:
+                            options += ["--keep", keep]
+                        if gwas_only:
+                            options += ["--gwas-only"]
+                        results = []
+                        for backend, path in [("--pfile", panel), ("--vcf-ref", bcf)]:
+                            name = backend[2:]
+                            leads, independent = self.d / (name+".leads.bcf"), self.d / (name+".ind.bcf")
+                            prefix, index, _ = self.run_plugin(name, reference=False, general=["--no-version"],
+                                                               specific=[backend, path, "--leads", leads,
+                                                                         "--independent", independent, *options])
+                            tables = {key: self.report(prefix, key) for key in
+                                      ["loci", "independent", "leads", "candidates", "excluded"]}
+                            streams = [command([BCFTOOLS, "view", "--no-version", "-Ov", stream]).stdout
+                                       for stream in [index, leads, independent]]
+                            run = {r["PARAMETER"]: r["VALUE"] for r in self.report(prefix, "run")}
+                            self.assertEqual(run["reference_multiallelic_skipped"], "1")
+                            self.assertEqual(run["reference_samples"], "6" if subset else "9")
+                            results.append((tables, streams))
+                        self.assertEqual(results[0], results[1])
+                        flank = [r for r in tables["candidates"] if r["ID"] == "flank" and r["SAMPLE"] == "A"]
+                        if gwas_only:
+                            self.assertEqual(flank, [])
+                        else:
+                            hit = next(r for r in flank if r["INDEPENDENT_KEY"] == "1:1000:A:G")
+                            self.assertEqual((hit["SOURCE"], hit["CALL_RATE"]), ("reference_only", "1"))
+                            self.assertEqual(float(hit["R2"]) == 1, hardcalls)
+                            self.assertEqual(min(int(r["START"]) for r in tables["loci"]), 700)
+
+    def test_tagging_visits_populated_ld_windows_in_gwas_coordinates(self):
+        x = [0, 1, 2] * 3
+        self.variants = [(20, "distant", x, 0, 0), (900, "left", x, 2, 0),
+                         (950, "filtered", x, 25, 25), (1000, "index1", x, 30, 30),
+                         (1100, "right", x, 3, 0), (5000, "gap", x, 0, 0),
+                         (6000, "absent", x, 30, 30), (9000, "index2", x, 28, 28)]
+        self.fixture("windows", chrom="chr1", ref_chrom="1")
+        ref = self.d / "windows.ref.vcf"
+        ref.write_text("".join(line for line in ref.read_text().splitlines(True) if "\tabsent\t" not in line))
+        gwas = self.d / "windows.gwas.vcf"
+        # This deletion overlaps the first window, but its start is outside it.
+        deletion = "chr1\t800\tdel\t" + "A"*151 + "\tA\t.\tPASS\t.\tLP\t4\t4\n"
+        gwas.write_text(gwas.read_text().replace("chr1\t900\t", deletion + "chr1\t900\t"))
+        regions = self.d / "windows.tsv"
+        regions.write_text("chr1\t1000\t1000\nchr1\t6000\t6000\nchr1\t9000\t9000\n")
+        prefix, _, _ = self.run_plugin("regional", gwas=self.indexed(gwas), ref=self.indexed(ref),
+                                       general=["-R", regions, "-i", 'ID!="filtered"'],
+                                       specific=["--ld-kb", "0.1", "--merge-kb", "0"])
+        run = {r["PARAMETER"]: r["VALUE"] for r in self.report(prefix, "run")}
+        self.assertEqual((run["records_scanned"], run["tagging_records"]), ("3", "5"))
+        bounds = [(r["SAMPLE"], r["START"], r["END"]) for r in self.report(prefix, "loci")]
+        self.assertIn(("A", "900", "1100"), bounds)
+        self.assertIn(("B", "1000", "1000"), bounds)
+        self.assertNotIn("filtered", {r["ID"] for r in self.report(prefix, "candidates")})
+
     def test_build_capabilities_and_disabled_pgen_errors(self):
         help_text = command([BCFTOOLS, "+" + str(PLUGIN), "--help"]).stderr
         enabled = "--pfile <prefix>" in help_text
         prefix, _, _ = self.run_plugin("capabilities")
         run = {r["PARAMETER"]: r["VALUE"] for r in self.report(prefix, "run")}
         self.assertEqual(run["pgen_support"], str(int(enabled)))
+        if "LF_EXPECT_PGEN" in os.environ:
+            self.assertEqual(enabled, os.environ["LF_EXPECT_PGEN"] == "1")
         if not enabled:
             self.assertEqual(run["pgenlib_revision"], ".")
             self.assertIn("PGEN support is disabled", help_text)

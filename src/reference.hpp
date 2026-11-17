@@ -290,19 +290,20 @@ struct VcfSource : GenotypeSource {
         return values;
     }
 };
-inline std::string reference_regions(bcf_hdr_t* hdr, const Windows& windows, int64_t radius) {
+inline std::string signal_regions(bcf_hdr_t* hdr, const Windows& windows, int64_t radius, ReferenceStore* loaded = nullptr) {
     std::ostringstream out;
     bool first = true;
-    int n = 0;
-    const char** names = bcf_hdr_seqnames(hdr,&n);
-    for (int i = 0; i < n; ++i) {
-        auto found = windows.find(chromosome(names[i]));
+    for (int rid = 0; rid < hdr->n[BCF_DT_CTG]; ++rid) {
+        const char* name = bcf_hdr_id2name(hdr,rid);
+        if (!name) continue;
+        const auto chr = chromosome(name);
+        auto found = windows.find(chr);
         if (found == windows.end()) continue;
         int64_t start = 0, end = -1;
         auto append = [&]() {
-            if (end < 0) return;
+            if (end < 0 || (loaded && !loaded->overlaps(chr,start,end))) return;
             if (!first) out << ',';
-            first = false; out << names[i] << ':' << start << '-' << end;
+            first = false; out << name << ':' << start << '-' << end;
         };
         for (int64_t pos : found->second) {
             int64_t left = std::max<int64_t>(1,pos-radius), right = pos+radius;
@@ -311,7 +312,6 @@ inline std::string reference_regions(bcf_hdr_t* hdr, const Windows& windows, int
         }
         append();
     }
-    free(names);
     return out.str();
 }
 struct ReferenceFilters {
@@ -438,7 +438,7 @@ private:
     }
     void load_vcf_variants(VcfSource& shard, const Windows& windows, int64_t radius, int threads) {
         const auto& prefix = shard.prefix;
-        const auto regions = reference_regions(shard.reader->header,windows,radius);
+        const auto regions = signal_regions(shard.reader->header,windows,radius);
         if (regions.empty()) return;
         for (int rid = 0; rid < shard.reader->header->n[BCF_DT_CTG]; ++rid) {
             auto found = windows.find(chromosome(bcf_hdr_id2name(shard.reader->header,rid)));

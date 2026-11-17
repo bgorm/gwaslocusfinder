@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=10000000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DS,Number=A,Type=Float,Description="ALT dosage">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	s0	s1	s2	s3	s4	s5	s6	s7	s8
+1	500	multi	A	C,G	.	PASS	.	GT	0/2	0/1	2/2	0/0	1/2	0/2	1/1	0/2	0/0
+1	700	flank	A	G	.	PASS	.	GT:DS	0/0:.	0/0:0.25	0/0:.	0/1:0.75	0/1:.	0/1:1.25	1/1:.	1/1:1.75	1/1:.
+1	1000	x	A	G	.	PASS	.	GT	0/0	0/0	0/0	0/1	0/1	0/1	1/1	1/1	1/1
+1	1200	copy	A	G	.	PASS	.	GT	0/0	0/0	0/0	0/1	0/1	0/1	1/1	1/1	1/1
+1	2000	z	A	G	.	PASS	.	GT:DS	0/0:.	0/0:0.25	0/1:.	0/0:0.25	0/1:.	1/1:1.75	0/1:.	1/1:1.75	1/1:.
+1	3000	y	A	G	.	PASS	.	GT	0/0	0/1	1/1	0/0	0/1	1/1	0/0	0/1	1/1
+1	3500	missing	A	G	.	PASS	.	GT	./.	0/1	1/1	0/0	0/1	1/1	0/0	0/1	1/1

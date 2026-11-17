@@ -68,7 +68,7 @@ $(BUILD_DIR)/test-storage: tests/test_storage.cpp src/storage.hpp src/io.hpp src
 test-storage: $(BUILD_DIR)/test-storage
 	$(BUILD_DIR)/test-storage
 test: plugin test-storage
-	LF_PLUGIN="$(abspath $(PLUGIN))" BCFTOOLS="$(BCFTOOLS)" $(PYTHON) -B -m unittest discover -s tests -p test_plugin.py -v
+	LF_PLUGIN="$(abspath $(PLUGIN))" LF_EXPECT_PGEN="$(WITH_PGEN)" BCFTOOLS="$(BCFTOOLS)" $(PYTHON) -B -m unittest discover -s tests -p test_plugin.py -v
 install: plugin
 	mkdir -p "$(DESTDIR)$(plugindir)"
 	install -m 644 $(PLUGIN) "$(DESTDIR)$(plugindir)/gwaslocusfinder.so"

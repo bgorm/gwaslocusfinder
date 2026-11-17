@@ -5,11 +5,11 @@
 #include <iostream>
 
 namespace lf {
-constexpr const char* version = "0.6.0";
+constexpr const char* version = "0.6.1";
 constexpr size_t none = std::numeric_limits<size_t>::max();
 struct Options {
     std::string input, out, regions, keep, temp_dir, missing = "skip";
-    std::vector<std::string> prefixes, vcf_refs;
+    std::vector<std::string> prefixes, vcf_refs, auxiliary_inputs;
     std::string output = "-", samples = "-", expression;
     std::map<std::string,std::string> outputs;
     bool samples_file = false, exclude_filter = false, force_samples = false, record_version = true;
@@ -27,6 +27,25 @@ struct Options {
     char output_type = 'b';
     bool hardcalls = false, gwas_only = false, custom_lp = false;
 };
+std::string selector_path(const std::string& spec) {
+    return !spec.empty() && spec.front() == '^' ? spec.substr(1) : spec;
+}
+void add_indexed_input(std::vector<std::string>& inputs, const std::string& path) {
+    const auto delimiter = path.find(HTS_IDX_DELIM);
+    if (delimiter != std::string::npos) {
+        inputs.push_back(path.substr(0,delimiter));
+        inputs.push_back(path.substr(delimiter+std::strlen(HTS_IDX_DELIM)));
+        return;
+    }
+    inputs.push_back(path);
+    for (const char* extension : {".csi", ".tbi"}) {
+        inputs.push_back(path+extension);
+        // HTSlib also looks for e.g. panel.csi beside panel.bcf.
+        fs::path alternate(path);
+        alternate.replace_extension(extension);
+        if (fs::is_regular_file(alternate)) inputs.push_back(alternate.string());
+    }
+}
 struct OutputFormat {
     const char* extension;
     const char* mode;
@@ -287,11 +306,18 @@ Options parse(int argc, char** argv, bool plugin) {
             require(!sample_selection_set, "Use only one GWAS sample selection (-s or -S)");
             require(!v.empty(), "GWAS sample selection must not be empty");
             o.samples = v; o.samples_file = a == "-S" || a == "--samples-file"; sample_selection_set = true;
+            if (o.samples_file) o.auxiliary_inputs.push_back(selector_path(v));
         }
         else if (a == "--regions" || a == "-r") { o.regions = v; o.regions_file = false; }
-        else if (a == "--regions-file" || a == "-R") { o.regions = v; o.regions_file = true; }
+        else if (a == "--regions-file" || a == "-R") {
+            o.regions = v; o.regions_file = true;
+            add_indexed_input(o.auxiliary_inputs, v);
+        }
         else if (a == "--targets" || a == "-t") { o.targets = v; o.targets_file = false; }
-        else if (a == "--targets-file" || a == "-T") { o.targets = v; o.targets_file = true; }
+        else if (a == "--targets-file" || a == "-T") {
+            o.targets = v; o.targets_file = true;
+            add_indexed_input(o.auxiliary_inputs, selector_path(v));
+        }
         else if (a == "--apply-filters" || a == "-f") {
             require(!v.empty(), "--apply-filters requires a nonempty FILTER list"); o.apply_filters = v;
         }
@@ -299,12 +325,16 @@ Options parse(int argc, char** argv, bool plugin) {
             require(v == "0" || v == "1" || v == "2", a + " must be 0, 1, or 2");
             if (a == "--regions-overlap") o.regions_overlap = v[0]-'0'; else o.targets_overlap = v[0]-'0';
         }
-        else if (a == "--keep") o.keep = v;
+        else if (a == "--keep") {
+            o.keep = v;
+            o.auxiliary_inputs.push_back(v);
+        }
         else if (a == "--missing-ref") o.missing = v;
         else if (a == "--pfile") o.prefixes.push_back(v);
         else if (a == "--vcf-ref") o.vcf_refs.push_back(v);
         else if (a == "--pfile-list" || a == "--vcf-ref-list") {
             auto& paths = a == "--pfile-list" ? o.prefixes : o.vcf_refs;
+            o.auxiliary_inputs.push_back(v);
             TextReader in(v);
             std::string line;
             size_t start = paths.size();
@@ -396,6 +426,8 @@ struct Locus {
     size_t candidates = 0;
 };
 struct Stats {
+    size_t tagging_records = 0;
+    double tagging_seconds = 0, candidate_expansion_seconds = 0;
     size_t scanned = 0, unsupported = 0, invalid_lp = 0, undefined_candidate_ld = 0, filtered = 0;
 };
 struct Analysis {
@@ -449,7 +481,7 @@ std::vector<int> select_gwas_samples(bcf_hdr_t* header, const Options& o) {
         return selected;
     }
     bool exclude = o.samples[0] == '^';
-    auto spec = exclude ? o.samples.substr(1) : o.samples;
+    auto spec = selector_path(o.samples);
     require(!spec.empty(), "Empty GWAS sample selection");
     int n = 0;
     char** names = hts_readlist(spec.c_str(),o.samples_file,&n);
@@ -477,6 +509,29 @@ template<class F> void nearby(const Nearby& map, const Signal& s, int64_t radius
     auto it = chr->second.lower_bound(s.pos-radius);
     for (; it != chr->second.end() && it->first <= s.pos+radius; ++it) f(it->second);
 }
+constexpr std::array<std::pair<const char*,const char*>,4> annotations = {{
+    {"LF_LOCUS","Locus number within this GWAS phenotype; join outputs by phenotype and locus number"},
+    {"LF_START","Start of the parent genomic locus on this chromosome (1-based inclusive)"},
+    {"LF_END","End of the parent genomic locus on this chromosome (1-based inclusive)"},
+    {"LF_INDEX_POS","Position of the strongest variant in the parent locus on this chromosome (1-based)"}
+}};
+void add_locus_annotations(bcf_hdr_t* header) {
+    for (const auto& tag : annotations) {
+        const std::string name = tag.first;
+        int id = bcf_hdr_id2int(header, BCF_DT_ID, tag.first);
+        if (bcf_hdr_idinfo_exists(header, BCF_HL_FMT, id)) {
+            require(bcf_hdr_id2type(header, BCF_HL_FMT, id) == BCF_HT_INT &&
+                    bcf_hdr_id2length(header, BCF_HL_FMT, id) == BCF_VL_FIXED &&
+                    bcf_hdr_id2number(header, BCF_HL_FMT, id) == 1,
+                    "Incompatible FORMAT/" + name + ": expected Number=1,Type=Integer");
+            continue;
+        }
+        const std::string definition = "##FORMAT=<ID=" + name + ",Number=1,Type=Integer,Description=\"" + tag.second + "\">";
+        require(bcf_hdr_append(header, definition.c_str()) == 0, "Cannot add FORMAT/" + name);
+    }
+    require(bcf_hdr_sync(header) == 0,"Cannot sync locus annotations");
+}
+
 std::vector<Analysis> read_signals(const Options& o, Header& header, Stats& stats) {
     GwasReader in(o.input,o.regions,o.threads,o.regions_file,o.regions_overlap,o.targets,o.targets_file,o.targets_overlap);
     auto filter = make_gwas_filter(o,in.header);
@@ -521,20 +576,25 @@ std::vector<Analysis> read_signals(const Options& o, Header& header, Stats& stat
     }
     header.reset(bcf_hdr_dup(in.header));
     require(header != nullptr,"Cannot copy GWAS header");
+    add_locus_annotations(header.get());
     for (auto& a : analyses) std::sort(a.signals.begin(),a.signals.end(),[](const auto& x,const auto& y) {
         if (x.lp != y.lp) return x.lp > y.lp;
         return std::tie(x.rid,x.pos,x.key) < std::tie(y.rid,y.pos,y.key);
     });
     return analyses;
 }
-void tag_reference(const Options& o, std::vector<Analysis>& analyses, Reference& ref) {
-    GwasReader in(o.input,"",o.threads);
+void tag_reference(const Options& o, const std::vector<Analysis>& analyses, Reference& ref,
+                   const std::string& regions, Stats& stats) {
+    // Reference keys use POS even for indels. Record overlap could visit a
+    // deletion in two disjoint windows or tag a key outside both windows.
+    GwasReader in(o.input,regions,o.threads,false,0);
     auto filter = make_gwas_filter(o,in.header);
     const auto filter_ids = gwas_filter_ids(o,in.header);
     std::vector<int> samples;
     for (auto& a : analyses) samples.push_back(a.sample_index);
     std::vector<double> lp;
     while (auto* r = in.next()) {
+        ++stats.tagging_records;
         const bool eligible = r->n_allele == 2 && passes_filter(o,filter.get(),filter_ids,r);
         bool decoded = false;
         // Filtered GWAS variants remain tagged as present, with missing LP,
@@ -552,7 +612,6 @@ void tag_reference(const Options& o, std::vector<Analysis>& analyses, Reference&
             }
         }
     }
-    ref.store.finish_tagging();
 }
 DisjointSet find_ld(const Options& o, Analysis& analysis, Reference& ref) {
     auto& signals = analysis.signals;
@@ -612,6 +671,7 @@ DisjointSet find_ld(const Options& o, Analysis& analysis, Reference& ref) {
         });
         if (owner != none) { a.is_lead = false; a.lead = owner; }
         previous[s.chr].emplace(s.pos,i);
+        const auto candidate_start = std::chrono::steady_clock::now();
         ref.store.neighborhood(s.chr, s.pos, o.ld_bp, [&](const RefVariant& v) {
             size_t j = v.index;
             if (j != s.reference) {
@@ -627,6 +687,8 @@ DisjointSet find_ld(const Options& o, Analysis& analysis, Reference& ref) {
                 a.start = std::min(a.start,v.pos); a.end = std::max(a.end,v.pos);
             }
         });
+        analysis.stats.candidate_expansion_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now()-candidate_start).count();
     }
     // Union all low-threshold LD edges first, then merge component envelopes.
     // This preserves chains A--B--C even when A and C are both lead variants.
@@ -707,15 +769,16 @@ bool same_path(const std::string& a, const std::string& b) {
 }
 struct OutputPaths {
     std::vector<std::string> inputs, outputs;
-    explicit OutputPaths(const Options& o) {
-        auto variant_input = [&](const std::string& path) {
-            inputs.push_back(path); inputs.push_back(path+".csi"); inputs.push_back(path+".tbi");
-        };
-        variant_input(o.input);
-        for (const auto& path : o.vcf_refs) variant_input(path);
+    explicit OutputPaths(const Options& o) : inputs(o.auxiliary_inputs) {
+        add_indexed_input(inputs, o.input);
+        for (const auto& path : o.vcf_refs) {
+            add_indexed_input(inputs, path);
+            // Reference opens the canonical filename, including its sidecars.
+            if (fs::is_symlink(path)) add_indexed_input(inputs, fs::canonical(path).string());
+        }
         for (auto path : o.prefixes) {
             if (ends_with(path,".pgen")) path.resize(path.size()-5);
-            for (const auto* suffix : {".pgen",".psam",".pvar",".pvar.zst",".pvar.gz"}) inputs.push_back(path+suffix);
+            for (const auto* suffix : {".pgen",".pgen.pgi",".psam",".pvar",".pvar.zst",".pvar.gz"}) inputs.push_back(path+suffix);
         }
     }
     void add(const std::string& path, bool allow_stream = false) {
@@ -732,6 +795,9 @@ struct OutputPaths {
     }
     void variant(const std::string& path, bool indexed = false) {
         if (path == "-") return;
+        // HTSlib strips ##idx## before opening the data file, including on writes.
+        require(path.find(HTS_IDX_DELIM) == std::string::npos,
+                "Explicit ##idx## filenames are unsupported for variant outputs; use -W to write an index");
         add(path,!indexed); add(path+".csi"); add(path+".tbi");
     }
 };
@@ -824,16 +890,6 @@ void write_selected_variants(const std::string& path, bcf_hdr_t* header,
         require(bcf_hdr_append(h.get(),meta.c_str()) == 0,"Cannot annotate output header");
         meta = "##gwaslocusfinderCommand=" + o.command;
         require(bcf_hdr_append(h.get(),meta.c_str()) == 0,"Cannot annotate output command");
-    }
-    const std::array<std::pair<const char*,const char*>,4> annotations = {{
-        {"LF_LOCUS","Locus number within this GWAS phenotype; join outputs by phenotype and locus number"},
-        {"LF_START","Start of the parent genomic locus on this chromosome (1-based inclusive)"},
-        {"LF_END","End of the parent genomic locus on this chromosome (1-based inclusive)"},
-        {"LF_INDEX_POS","Position of the strongest variant in the parent locus on this chromosome (1-based)"}
-    }};
-    for (const auto& tag : annotations) {
-        const std::string definition = "<ID=" + std::string(tag.first) + ",Number=1,Type=Integer,Description=\"" + tag.second + "\">";
-        require(bcf_hdr_append(h.get(),("##FORMAT="+definition).c_str()) == 0,"Cannot add FORMAT/" + std::string(tag.first));
     }
     require(bcf_hdr_sync(h.get()) == 0,"Cannot sync output header");
     struct Selected { const Signal* signal; std::vector<int32_t> loci; };
@@ -1002,6 +1058,8 @@ void write_outputs(ReportOutputs& reports, const Options& o, bcf_hdr_t* header,
             << "\nundefined_candidate_ld\t" << stats.undefined_candidate_ld << "\nelapsed_seconds\t" << elapsed << '\n';
         if (ref) {
             out << "reference_backend\t" << (o.vcf_refs.empty() ? "pgen" : "vcf") << "\nreference_samples\t" << ref->subset.size()
+                << "\ntagging_records\t" << stats.tagging_records << "\ntagging_seconds\t" << stats.tagging_seconds
+                << "\ncandidate_expansion_seconds\t" << stats.candidate_expansion_seconds
                 << "\nreference_variants_in_windows\t" << ref->store.size() << "\nreference_duplicates_skipped\t" << ref->duplicates_skipped
                 << "\nreference_variants_qc_evaluated\t" << ref->qc_counts.evaluated
                 << "\nreference_variants_qc_passed\t" << ref->qc_counts.passed
@@ -1019,10 +1077,14 @@ void write_outputs(ReportOutputs& reports, const Options& o, bcf_hdr_t* header,
         out.close();
     }
 }
-int run(int argc, char** argv, bool plugin, FilterFactory filters) {
+int run(int argc, char** argv, bool plugin, FilterApi filters) {
     const auto start = std::chrono::steady_clock::now();
     Options o = parse(argc,argv,plugin);
-    o.filter_factory = filters;
+    o.filter_factory = filters.compile;
+    if (!o.expression.empty()) {
+        auto paths = filters.input_files(o.expression);
+        o.auxiliary_inputs.insert(o.auxiliary_inputs.end(),paths.begin(),paths.end());
+    }
     std::ostringstream command;
     for (int i = 0; i < argc; ++i) { if (i) command << ' '; command << std::quoted(argv[i]); }
     for (char c : command.str()) {
@@ -1054,7 +1116,11 @@ int run(int argc, char** argv, bool plugin, FilterFactory filters) {
                       << " duplicate reference rows in queried windows; kept the first occurrence of each allele-pair key"
                       << " (showing at most 10 duplicate details).\n";
         std::cerr << "Reference: " << ref->store.size() << " nearby variants before reference QC, " << ref->subset.size() << " selected samples\n";
-        if (!windows.empty()) tag_reference(o,analyses,*ref);
+        const auto tagging_start = std::chrono::steady_clock::now();
+        const auto regions = signal_regions(header.get(), windows, o.ld_bp, &ref->store);
+        if (!regions.empty()) tag_reference(o,analyses,*ref,regions,stats);
+        ref->store.finish_tagging();
+        stats.tagging_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-tagging_start).count();
     }
     for (size_t phenotype = 0; phenotype < analyses.size(); ++phenotype) {
         auto& a = analyses[phenotype];
@@ -1062,6 +1128,7 @@ int run(int argc, char** argv, bool plugin, FilterFactory filters) {
         auto components = ref ? find_ld(o,a,*ref) : find_distance(o,a);
         a.loci = collect_loci(a.signals,a.independent,components);
         if (ref) count_candidates(a,ref->scratch);
+        stats.candidate_expansion_seconds += a.stats.candidate_expansion_seconds;
         stats.invalid_lp += a.stats.invalid_lp;
         stats.undefined_candidate_ld += a.stats.undefined_candidate_ld;
         std::cerr << a.sample << ": " << a.loci.size() << " loci; " << a.excluded.size() << " excluded significant variants\n";
@@ -1079,7 +1146,7 @@ int run(int argc, char** argv, bool plugin, FilterFactory filters) {
     if (stats.unsupported) std::cerr << "Skipped " << stats.unsupported << " multiallelic/symbolic GWAS records; normalize/split before analysis\n";
     return 0;
 }
-int entry(int argc, char** argv, bool plugin, FilterFactory filters) {
+int entry(int argc, char** argv, bool plugin, FilterApi filters) {
     try { return run(argc,argv,plugin,filters); }
     catch (const HelpDone& e) { return e.status; }
     catch (const std::exception& e) { std::cerr << "gwaslocusfinder: " << e.what() << '\n'; return 1; }

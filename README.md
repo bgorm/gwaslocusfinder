@@ -16,6 +16,7 @@ lead variants, independent variants, and tabular reports are optional outputs.
 - [Usage](#usage)
 - [Installation](#installation)
 - [Find significant loci](#find-significant-loci)
+- [Worked example using Alzheimer’s disease summary statistics](#alzheimers-disease-on-chromosome-19)
 - [Reference panels](#reference-panels)
 - [Locus definition](#locus-definition)
 - [Outputs](#outputs)
@@ -32,7 +33,7 @@ bcftools +gwaslocusfinder --help
 <!-- BEGIN GWASLOCUSFINDER HELP -->
 ```text
 About: Find significant loci in GWAS-VCF summary statistics using LD clumping and FUMA-style aggregation.
-(version 0.6.0)
+(version 0.6.1)
 
    Reads indexed GWAS-VCF/BCF summary statistics with FORMAT/LP (-log10 P),
    treating each selected sample column as a separate phenotype.
@@ -253,8 +254,9 @@ make install plugindir=/path/to/bcftools/plugins
 load the plugin directly from `build/` with `BCFTOOLS_PLUGINS` as above.
 For a minimal installation, add `WITH_PGEN=0` to the install command.
 
-The integration tests use synthetic VCF/BCF panels and require Python 3
-and bcftools:
+The integration tests require Python 3 and bcftools. PGEN-enabled builds also
+read a small synthetic PGEN and compare its results with the matching VCF.
+The fixture is included in the repository.
 
 ```sh
 make test
@@ -303,6 +305,109 @@ including normalized indels. Multiallelic and symbolic records are skipped.
 GWAS and reference coordinates must use the same genome assembly. Normalize
 variant representations and split multiallelic records before analysis where
 needed. Rebuild indexes whenever input files change.
+
+### Alzheimer's disease on chromosome 19
+
+This worked example uses the GRCh38 Alzheimer’s disease summary statistics
+from Bellenguez et al. (2022), the same study used in the `genecontext`
+walkthrough. It clumps chromosome 19 associations using European reference
+samples. [GWAS Catalog GCST90027158](https://www.ebi.ac.uk/gwas/studies/GCST90027158)
+· [Study](https://doi.org/10.1038/s41588-022-01024-z)
+· [genecontext example](https://github.com/bgorm/genecontext#example-gwas-summary-statistics-to-annotated-loci)
+
+Run the blocks in order in Bash with `bcftools`, `+gwaslocusfinder`,
+[`+munge` from the score suite](https://github.com/freeseek/score#installation),
+`curl`, `gzip`, `awk` and `fold`. Allow about 1.2 GiB of downloads and 3 GiB
+of free disk space. Either build of gwaslocusfinder can run the BCF example.
+
+Download the study and the chromosome 19 sequence. The ENA reference service
+serves the sequence by its MD5. These are the same 58,617,616 bases as `chr19`
+in the GRCh38 no-ALT analysis set used by the score suite.
+
+```bash
+set -euo pipefail
+mkdir -p ad-loci-example/tmp
+cd ad-loci-example
+export TMPDIR="$PWD/tmp"
+
+gwas=GCST90027158_buildGRCh38.tsv.gz
+curl -fsSL --retry 3 -o "$gwas" \
+  "https://ftp.ebi.ac.uk/pub/databases/gwas/summary_statistics/GCST90027001-GCST90028000/GCST90027158/$gwas"
+
+{
+  printf '>chr19\n'
+  curl -fsSL --retry 3 https://www.ebi.ac.uk/ena/cram/md5/85f9f4fc152c58cb7913c06d6b98573a | fold -w 70
+  printf '\n'
+} > chr19.grch38.fa
+```
+
+In this study file, column 3 is the chromosome. Keep the header and chromosome
+19 rows, orient alleles against the FASTA with `+munge`, and sort and index
+the biallelic GWAS records. The resulting BCF has 435,065 records and one
+phenotype named `AD_2022`. If you already have `ad.bcf` from `genecontext`,
+`bcftools view -r chr19 -Ob -W -o ad.chr19.bcf ad.bcf` supplies this input.
+
+```bash
+gzip -dc "$gwas" | awk -F '\t' 'NR == 1 || $3 == 19' |
+  bcftools +munge -c SSF -f chr19.grch38.fa -s AD_2022 -Ou - |
+  bcftools view -f PASS,. -m2 -M2 -Ou |
+  bcftools sort -T "$TMPDIR/" -Ob -o ad.chr19.bcf -W
+```
+
+Download the phased HGDP+1kGP v2 reference BCF and its CSI index. Intersect
+its sample names with the 1000 Genomes Phase 3 `EUR` labels to create the
+reference `--keep` file. The intersection contains **492 individuals**.
+[HGDP+1kGP reference publication](https://pmc.ncbi.nlm.nih.gov/articles/PMC11216312/)
+
+```bash
+panel=hgdp1kgp_chr19.filtered.SNV_INDEL.phased.shapeit5.bcf
+panel_url=https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2
+curl -fsSL --retry 3 -o "$panel" "$panel_url/$panel"
+curl -fsSL --retry 3 -o "$panel.csi" "$panel_url/$panel.csi"
+curl -fsSL --retry 3 -o phase3.panel \
+  https://1000genomes.s3.amazonaws.com/release/20130502/integrated_call_samples_v3.20130502.ALL.panel
+
+bcftools query -l "$panel" > ref.samples
+awk 'NR == FNR {if ($3 == "EUR") eur[$1] = 1; next} $1 in eur {print $1}' \
+  phase3.panel ref.samples > eur.keep
+wc -l eur.keep
+```
+
+Run LD clumping and aggregation with the default significance and LD
+thresholds and a minimum reference MAF of 1% in those 492 individuals. This
+panel supplies phased `GT`. HTSlib 1.25 can print a header warning about the
+panel’s phase-confidence `PP` field while reading it. The plugin uses `GT` here.
+
+```bash
+bcftools +gwaslocusfinder -r chr19 -Ob -W -o ad.index.bcf ad.chr19.bcf -- \
+  --vcf-ref "$panel" --keep eur.keep --maf 0.01 \
+  --leads ad.leads.bcf --independent ad.independent.bcf --reports-prefix ad
+
+bcftools query -f '%CHROM\t%POS\t%ID[\t%LF_LOCUS\t%LF_START\t%LF_END]\n' ad.index.bcf
+```
+
+The query prints the four index variants, their locus numbers, and their
+inclusive bounds on GRCh38. The accompanying outputs contain 65 leads and
+184 independent significant variants. For example, `ad.loci.tsv` assigns
+58 leads to locus 3, whose index is `rs117310449`.
+
+```text
+chr19	1050875	rs12151021	1	1009366	1093669
+chr19	1854152	rs12972720	2	1808570	1891993
+chr19	44890259	rs117310449	3	43752735	45597073
+chr19	54265512	rs12984029	4	54251846	54283071
+```
+
+**Using PGEN.** With PLINK 2 and a PGEN-enabled plugin, convert the same
+reference and keep the selected individuals at import. This produces the same
+index variants, leads, independent variants, and five result tables.
+
+```bash
+plink2 --bcf "$panel" --keep eur.keep --make-pgen --out chr19.eur
+bcftools +gwaslocusfinder -r chr19 -Ob -W -o ad.pgen.index.bcf ad.chr19.bcf -- \
+  --pfile chr19.eur --maf 0.01 \
+  --leads ad.pgen.leads.bcf --independent ad.pgen.independent.bcf --reports-prefix ad.pgen
+```
 
 ### Run an analysis
 
@@ -605,7 +710,9 @@ bcftools index trait.leads.bcf
 
 The main stream goes to `/dev/null`. Omit `-W` in this case because it applies
 to every named variant output, including the device; index the leads separately.
-Output paths and index sidecars must be distinct from inputs and one another.
+Each named output, report, and index sidecar needs its own path. The plugin
+checks these paths against the GWAS, the reference, sample and interval files,
+reference lists, and file operands in bcftools filters before writing.
 Existing output files are overwritten directly.
 
 ### Phenotypes and locus annotations
@@ -620,6 +727,10 @@ are stored in FORMAT:
 | LF_START | Parent locus start, 1-based inclusive |
 | LF_END | Parent locus end, 1-based inclusive |
 | LF_INDEX_POS | Position of the strongest variant in the parent locus, 1-based |
+
+All four FORMAT fields have `Number=1,Type=Integer`. An input from an earlier
+run can supply those definitions. The plugin writes fresh values for this run
+and reports an error if a reserved FORMAT field has an incompatible definition.
 
 Locus IDs start at 1 separately for each phenotype and are shared across the
 index, lead, and independent outputs from a run. Join by phenotype and
@@ -797,6 +908,12 @@ records still use RAM. Memory therefore is not strictly limited to one LD
 window, but full reference metadata and candidate relationships no longer need
 to fit in RAM.
 
+The second GWAS pass uses the index to visit merged LD windows containing
+reference variants. It can read beyond discovery regions to tag candidates at
+both ends of each window. The run report records the GWAS rows visited
+(`tagging_records`), time spent tagging (`tagging_seconds`), and time spent
+expanding candidate blocks (`candidate_expansion_seconds`).
+
 VCF/BCF reference scans use indexed signal windows. The metadata pass skips
 FORMAT parsing; genotype validation occurs when records are fetched for LD.
 Nearby forward genotype reads reuse the reader within the same signal window.
@@ -811,8 +928,9 @@ scoring.
 LD mode excludes chromosomes other than 1-22 and X, reporting significant
 records as `unsupported_chromosome`. Sex-specific weighting, automatic PAR
 remapping, and multiallelic allele-dosage decomposition are not implemented.
-Whole-genome performance and end-to-end agreement with a particular FUMA
-reference analysis have not been benchmarked.
+For measured wall time, memory, scratch space, and genotype reads on real
+GWAS inputs, see the [performance benchmarks](benchmarks/README.md).
+Agreement with a particular FUMA analysis requires separate validation.
 
 ## License
 
