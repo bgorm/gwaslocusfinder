@@ -308,21 +308,20 @@ needed. Rebuild indexes whenever input files change.
 
 ### Alzheimer's disease on chromosome 19
 
-This worked example uses the GRCh38 Alzheimer’s disease summary statistics
-from Bellenguez et al. (2022), the same study used in the `genecontext`
-walkthrough. It clumps chromosome 19 associations using European reference
-samples. [GWAS Catalog GCST90027158](https://www.ebi.ac.uk/gwas/studies/GCST90027158)
-· [Study](https://doi.org/10.1038/s41588-022-01024-z)
-· [genecontext example](https://github.com/bgorm/genecontext#example-gwas-summary-statistics-to-annotated-loci)
+Find Alzheimer’s disease loci on chromosome 19 using the genome-wide GRCh38
+summary statistics from Bellenguez et al. (2022) and a European LD reference.
+Download the full study and genome sequence once. Only the chromosome 19 LD
+panel is needed for this regional analysis.
+[GWAS Catalog GCST90027158](https://www.ebi.ac.uk/gwas/studies/GCST90027158) ·
+[Study](https://doi.org/10.1038/s41588-022-01024-z)
 
-Run the blocks in order in Bash with `bcftools`, `+gwaslocusfinder`,
-[`+munge` from the score suite](https://github.com/freeseek/score#installation),
-`curl`, `gzip`, `awk` and `fold`. Allow about 1.2 GiB of downloads and 3 GiB
-of free disk space. Either build of gwaslocusfinder can run the BCF example.
+Run the blocks in order in Bash with `bcftools`, `+gwaslocusfinder`, `+munge`,
+`curl`, `gzip`, and `awk`. Downloads total about 2 GiB. Allow 8 GiB of free
+disk space for the inputs, sorting, and outputs. Either build of
+gwaslocusfinder can use the BCF panel. [+munge installation](https://github.com/freeseek/score#installation)
 
-Download the study and the chromosome 19 sequence. The ENA reference service
-serves the sequence by its MD5. These are the same 58,617,616 bases as `chr19`
-in the GRCh38 no-ALT analysis set used by the score suite.
+Download the study from the GWAS Catalog and the GRCh38 no-ALT analysis set
+with UCSC chromosome names from NCBI.
 
 ```bash
 set -euo pipefail
@@ -334,25 +333,24 @@ gwas=GCST90027158_buildGRCh38.tsv.gz
 curl -fsSL --retry 3 -o "$gwas" \
   "https://ftp.ebi.ac.uk/pub/databases/gwas/summary_statistics/GCST90027001-GCST90028000/GCST90027158/$gwas"
 
-{
-  printf '>chr19\n'
-  curl -fsSL --retry 3 https://www.ebi.ac.uk/ena/cram/md5/85f9f4fc152c58cb7913c06d6b98573a | fold -w 70
-  printf '\n'
-} > chr19.grch38.fa
+fasta=GCA_000001405.15_GRCh38_no_alt_analysis_set.fna
+fasta_url=https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids
+curl -fsSL --retry 3 -o "$fasta.gz" "$fasta_url/$fasta.gz"
+gzip -dc "$fasta.gz" > "$fasta"
 ```
 
-In this study file, column 3 is the chromosome. Keep the header and chromosome
-19 rows, orient alleles against the FASTA with `+munge`, and sort and index
-the biallelic GWAS records. The resulting BCF has 435,065 records and one
-phenotype named `AD_2022`. If you already have `ad.bcf` from `genecontext`,
-`bcftools view -r chr19 -Ob -W -o ad.chr19.bcf ad.bcf` supplies this input.
+Convert the entire study to GWAS-VCF. `+munge` orients alleles against the
+FASTA and creates its `.fai` index if needed. The pipeline retains passing
+biallelic records and writes a coordinate-sorted, indexed `ad.bcf` with one
+phenotype, `AD_2022`. This BCF can be reused for any chromosome.
 
 ```bash
-gzip -dc "$gwas" | awk -F '\t' 'NR == 1 || $3 == 19' |
-  bcftools +munge -c SSF -f chr19.grch38.fa -s AD_2022 -Ou - |
+bcftools +munge -c SSF -f "$fasta" -s AD_2022 -Ou "$gwas" |
   bcftools view -f PASS,. -m2 -M2 -Ou |
-  bcftools sort -T "$TMPDIR/" -Ob -o ad.chr19.bcf -W
+  bcftools sort -T "$TMPDIR/" -Ob -o ad.bcf -W
 ```
+
+For this release, `ad.bcf` contains 19,811,681 records, including 435,065 on chromosome 19.
 
 Download the phased HGDP+1kGP v2 reference BCF and its CSI index. Intersect
 its sample names with the 1000 Genomes Phase 3 `EUR` labels to create the
@@ -373,13 +371,14 @@ awk 'NR == FNR {if ($3 == "EUR") eur[$1] = 1; next} $1 in eur {print $1}' \
 wc -l eur.keep
 ```
 
-Run LD clumping and aggregation with the default significance and LD
-thresholds and a minimum reference MAF of 1% in those 492 individuals. This
-panel supplies phased `GT`. HTSlib 1.25 can print a header warning about the
-panel’s phase-confidence `PP` field while reading it. The plugin uses `GT` here.
+Use the bcftools region option `-r chr19` to select chromosome 19 from the
+indexed, genome-wide `ad.bcf`. Run LD clumping and aggregation with the default
+significance and LD thresholds and a minimum reference MAF of 1% in the 492
+individuals. This panel supplies phased `GT`. HTSlib 1.25 can print a header
+warning for its phase-confidence `PP` field while reading it. The plugin uses `GT` here.
 
 ```bash
-bcftools +gwaslocusfinder -r chr19 -Ob -W -o ad.index.bcf ad.chr19.bcf -- \
+bcftools +gwaslocusfinder -r chr19 -Ob -W -o ad.index.bcf ad.bcf -- \
   --vcf-ref "$panel" --keep eur.keep --maf 0.01 \
   --leads ad.leads.bcf --independent ad.independent.bcf --reports-prefix ad
 
@@ -404,10 +403,13 @@ index variants, leads, independent variants, and five result tables.
 
 ```bash
 plink2 --bcf "$panel" --keep eur.keep --make-pgen --out chr19.eur
-bcftools +gwaslocusfinder -r chr19 -Ob -W -o ad.pgen.index.bcf ad.chr19.bcf -- \
+bcftools +gwaslocusfinder -r chr19 -Ob -W -o ad.pgen.index.bcf ad.bcf -- \
   --pfile chr19.eur --maf 0.01 \
   --leads ad.pgen.leads.bcf --independent ad.pgen.independent.bcf --reports-prefix ad.pgen
 ```
+
+To annotate the index positions in `ad.index.bcf` with nearby genes, use a
+GRCh38 GTF or GFF3 with the optional bcftools plugin [+genecontext](https://github.com/bgorm/genecontext).
 
 ### Run an analysis
 
@@ -904,9 +906,8 @@ reference coverage, phenotype count, and optional candidate reports.
 
 PVAR is scanned once to preserve original PGEN row numbers. PGEN's own
 whole-file indexes, the sparse coordinate index, and retained significant GWAS
-records still use RAM. Memory therefore is not strictly limited to one LD
-window, but full reference metadata and candidate relationships no longer need
-to fit in RAM.
+records use RAM across LD windows. Full reference metadata and candidate
+relationships are stored in temporary files.
 
 The second GWAS pass uses the index to visit merged LD windows containing
 reference variants. It can read beyond discovery regions to tag candidates at

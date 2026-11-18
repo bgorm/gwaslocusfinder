@@ -19,8 +19,10 @@ struct AlignedBuffer {
     AlignedBuffer() = default;
     AlignedBuffer(const AlignedBuffer&) = delete;
     ~AlignedBuffer() { if (ptr) plink2::aligned_free(ptr); }
-    void allocate(size_t bytes) {
+    void allocate_cachelines(size_t count) {
         require(!ptr, "Internal error: buffer allocated twice");
+        require(count <= SIZE_MAX / plink2::kCacheline, "PGEN buffer size exceeds address space");
+        const size_t bytes = count * plink2::kCacheline;
         if (bytes) require(!plink2::cachealigned_malloc(bytes, &ptr), "Out of memory allocating PGEN buffers");
     }
     template<class T> T* as() { return static_cast<T*>(ptr); }
@@ -134,21 +136,21 @@ struct PgenSource : GenotypeSource {
             info.allele_idx_offsets = offsets.data();
         }
         if ((ctrl & 0xc0) == 0xc0) {
-            nonref.allocate(((static_cast<size_t>(raw_count)+511)/512)*64);
+            nonref.allocate_cachelines(BitCtToCachelineCt(raw_count));
             info.nonref_flags = nonref.as<uintptr_t>();
         }
-        info_mem.allocate(n_info*64);
+        info_mem.allocate_cachelines(n_info);
         require(PgfiInitPhase2(ctrl, 1, 0, 0, 0, raw_count, &max_record, &info,
                               info_mem.as<unsigned char>(), &n_reader, error) == kPglRetSuccess,
                 "PGEN metadata initialization failed: " + path + ": " + error);
         require(!(info.gflags & kfPgenGlobalMultiallelicHardcallFound) || !offsets.empty(),
                 "PGEN/PVAR mismatch: multiallelic PGEN has biallelic PVAR: " + path);
-        reader_mem.allocate(n_reader*64);
+        reader_mem.allocate_cachelines(n_reader);
         require(PgrInit(path.c_str(), max_record, &info, &reader, reader_mem.as<unsigned char>())
                 == kPglRetSuccess, "Cannot initialize PGEN reader: " + path);
-        geno.allocate(((static_cast<size_t>(samples)+255)/256)*64);
-        dosage_present.allocate(((static_cast<size_t>(samples)+511)/512)*64);
-        dosage_main.allocate(((static_cast<size_t>(samples)*2+63)/64)*64);
+        geno.allocate_cachelines(NypCtToCachelineCt(samples));
+        dosage_present.allocate_cachelines(BitCtToCachelineCt(samples));
+        dosage_main.allocate_cachelines(DivUp(samples,kInt16PerCacheline));
         opened = true;
     }
     std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) override {
