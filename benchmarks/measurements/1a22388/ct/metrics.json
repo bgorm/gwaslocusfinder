@@ -1,0 +1,14 @@
+{
+  "wall_seconds": 287.28,
+  "peak_rss_mib": 270.58,
+  "sampled_peak_scratch_mib": 127.21,
+  "records_scanned": 147598,
+  "reference_variants_in_windows": 1040019,
+  "reference_samples": 3163,
+  "significant_records": 147598,
+  "loci": 4,
+  "genotype_reads": 4042420,
+  "tagging_records": 147598,
+  "tagging_seconds": 1.415719876,
+  "candidate_expansion_seconds": 116.6661856
+}

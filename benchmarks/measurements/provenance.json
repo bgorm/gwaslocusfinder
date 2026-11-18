@@ -1,0 +1,28 @@
+{
+  "measurement_script": {
+    "path": "scripts/benchmark.py",
+    "commit": "1a22388423ca243adaeb88e03497484c441653f6"
+  },
+  "pinned_builds": {
+    "84cde27": {
+      "version": "0.6.0",
+      "plugin_commit": "84cde274211342add00216c9523085cb4f60a7d6",
+      "plugin_sha256": "281945994206b1fdd2edff19a27e2f3103228e5ad41e44a5dbd76fa340f55d8d"
+    },
+    "1a22388": {
+      "version": "0.6.1",
+      "plugin_commit": "1a22388423ca243adaeb88e03497484c441653f6",
+      "plugin_sha256": "e03deead07177223f4a7420891adfba2c13b8264d3d257eb8b7b5f6aa5880575"
+    }
+  },
+  "original_measurements": {
+    "initial/baseline-*": {
+      "version": "0.6.0",
+      "plugin_commit": "84cde274211342add00216c9523085cb4f60a7d6"
+    },
+    "initial/indexed-*": {
+      "version": "0.6.1 development",
+      "plugin_commit": null
+    }
+  }
+}
