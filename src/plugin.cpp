@@ -56,7 +56,10 @@ std::vector<std::string> filter_input_files(const std::string& expression) {
         }
         const auto start = ++pos;
         pos = sample_list ? expression.find(']',start) : expression.find_first_of(" \t\n\r\f\v=!",start);
-        auto path = expanded(expression.substr(start,pos-start));
+        auto name = expression.substr(start,pos-start);
+        // bcftools drops one final comma from a value token before expanding @file.
+        if (!sample_list && !name.empty() && name.back() == ',') name.pop_back();
+        auto path = expanded(std::move(name));
         if (sample_list && !std::filesystem::exists(path)) {
             // FMT/TAG[@file:indices] tries the literal filename first.
             const auto colon = path.rfind(':');

@@ -33,7 +33,7 @@ bcftools +gwaslocusfinder --help
 <!-- BEGIN GWASLOCUSFINDER HELP -->
 ```text
 About: Find significant loci in GWAS-VCF summary statistics using LD clumping and FUMA-style aggregation.
-(version 0.6.1)
+(version 0.6.2)
 
    Reads indexed GWAS-VCF/BCF summary statistics with FORMAT/LP (-log10 P),
    treating each selected sample column as a separate phenotype.

@@ -5,7 +5,7 @@
 #include <iostream>
 
 namespace lf {
-constexpr const char* version = "0.6.1";
+constexpr const char* version = "0.6.2";
 constexpr size_t none = std::numeric_limits<size_t>::max();
 struct Options {
     std::string input, out, regions, keep, temp_dir, missing = "skip";

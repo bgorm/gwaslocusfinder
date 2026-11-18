@@ -312,6 +312,29 @@ class PublicPluginTests(unittest.TestCase):
                 if kind != "index":
                     self.assertEqual(output.read_bytes(), b"previous index output")
 
+    def test_filter_file_trailing_comma_matches_bcftools(self):
+        cases = [
+            ("ids.txt", "ID=@{path},", b"x\n", "x"),
+            ("with,comma,", "ID=@{path},", b"z\n", "z"),
+            ("phenotypes,", "FMT/LP[@{path}]>35", b"B\n", "copy"),
+        ]
+        for name, template, contents, expected_id in cases:
+            with self.subTest(name=name):
+                path = self.d / name
+                path.write_bytes(contents)
+                expr = template.format(path=path)
+                native = command([BCFTOOLS, "view", "-H", "-i", expr, self.gwas])
+                self.assertEqual([line.split("\t")[2] for line in native.stdout.splitlines()], [expected_id])
+                args = [BCFTOOLS, "+" + str(PLUGIN), "-i", expr, "-Ov", "-o"]
+                tail = [self.gwas, "--", "--distance-kb", "0"]
+                collision = command([*args, path, *tail], ok=False)
+                self.assertIn("collides with input", collision.stderr)
+                self.assertEqual(path.read_bytes(), contents)
+                # A distinct destination may itself have a trailing comma.
+                output = self.d / (name + ",")
+                command([*args, output, *tail])
+                self.assertEqual(self.ids(output), [expected_id])
+
     def test_explicit_output_index_cannot_alias_input(self):
         keep = self.d / "selected.txt"
         keep.write_text("s0\ns1\ns2\n")
