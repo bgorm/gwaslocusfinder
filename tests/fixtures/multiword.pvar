@@ -1,0 +1,8 @@
+##contig=<ID=1,length=10000000>
+#CHROM	POS	ID	REF	ALT	FILTER
+1	700	flank	A	G	PASS
+1	1000	x	A	G	PASS
+1	1200	copy	A	G	PASS
+1	2000	z	A	G	PASS
+1	3000	y	A	G	PASS
+1	3500	missing	A	G	PASS

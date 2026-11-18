@@ -16,6 +16,7 @@ files=(
     scripts/bootstrap.sh scripts/export-plugin.sh scripts/benchmark.py benchmarks/README.md
     benchmarks/measurements/provenance.json benchmarks/measurements/{84cde27,1a22388,initial}/*/metrics.json
     tests/fixtures/README.md tests/fixtures/panel.vcf tests/fixtures/panel.pgen tests/fixtures/panel.pvar tests/fixtures/panel.psam
+    tests/fixtures/multiword.{vcf.gz,pgen,pvar,psam}
     tests/test_plugin.py tests/test_storage.cpp .github/workflows/build.yml
 )
 for file in "${files[@]}"; do

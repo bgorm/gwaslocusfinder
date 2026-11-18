@@ -98,8 +98,10 @@ inline std::vector<uint32_t> select_samples(const std::vector<std::pair<std::str
 struct GenotypeSource {
     std::string prefix;
     uint32_t samples = 0;
+    const std::vector<uint32_t>& subset;
+    explicit GenotypeSource(const std::vector<uint32_t>& selected) : subset(selected) {}
     virtual ~GenotypeSource() = default;
-    virtual std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) = 0;
+    virtual std::vector<float> read(const RefVariant& variant, bool hardcalls) = 0;
 };
 #if LF_WITH_PGEN
 struct PgenSource : GenotypeSource {
@@ -108,8 +110,13 @@ struct PgenSource : GenotypeSource {
     plink2::PgenFileInfo info{};
     plink2::PgenReader reader{};
     AlignedBuffer info_mem, reader_mem, nonref, geno, dosage_present, dosage_main;
+    AlignedBuffer sample_include, cumulative_popcounts;
+    plink2::PgrSampleSubsetIndex subset_index{};
     bool opened = false;
-    PgenSource() { plink2::PreinitPgfi(&info); plink2::PreinitPgr(&reader); }
+    explicit PgenSource(const std::vector<uint32_t>& selected) : GenotypeSource(selected) {
+        plink2::PreinitPgfi(&info);
+        plink2::PreinitPgr(&reader);
+    }
     PgenSource(const PgenSource&) = delete;
     ~PgenSource() override {
         plink2::PglErr err = plink2::kPglRetSuccess;
@@ -148,32 +155,46 @@ struct PgenSource : GenotypeSource {
         reader_mem.allocate_cachelines(n_reader);
         require(PgrInit(path.c_str(), max_record, &info, &reader, reader_mem.as<unsigned char>())
                 == kPglRetSuccess, "Cannot initialize PGEN reader: " + path);
-        geno.allocate_cachelines(NypCtToCachelineCt(samples));
-        dosage_present.allocate_cachelines(BitCtToCachelineCt(samples));
-        dosage_main.allocate_cachelines(DivUp(samples,kInt16PerCacheline));
+        if (subset.size() < samples) {
+            const size_t mask_lines = BitCtToCachelineCt(samples);
+            const uint32_t words = BitCtToWordCt(samples);
+            sample_include.allocate_cachelines(mask_lines);
+            auto* mask = sample_include.as<uintptr_t>();
+            ZeroWArr(mask_lines * kWordsPerCacheline, mask);
+            for (uint32_t i : subset) SetBit(i, mask);
+            cumulative_popcounts.allocate_cachelines(Int32CtToCachelineCt(words));
+            auto* counts = cumulative_popcounts.as<uint32_t>();
+            FillCumulativePopcounts(mask, words, counts);
+            // Setting the subset clears pgenlib's LD cache. Do this once per shard.
+            PgrSetSampleSubsetIndex(counts, &reader, &subset_index);
+        } else {
+            PgrClearSampleSubsetIndex(&reader, &subset_index);
+        }
+        geno.allocate_cachelines(NypCtToCachelineCt(subset.size()));
+        dosage_present.allocate_cachelines(BitCtToCachelineCt(subset.size()));
+        dosage_main.allocate_cachelines(DivUp(subset.size(),kInt16PerCacheline));
         opened = true;
     }
-    std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) override {
+    std::vector<float> read(const RefVariant& variant, bool hardcalls) override {
         open();
         const uint32_t row = variant.row;
         using namespace plink2;
-        PgrSampleSubsetIndex pssi;
-        PgrClearSampleSubsetIndex(nullptr, &pssi);
+        const auto* mask = sample_include.as<uintptr_t>();
+        const uint32_t count = subset.size();
         uint32_t dosage_ct = 0;
         auto* g = geno.as<uintptr_t>();
         auto* present = dosage_present.as<uintptr_t>();
         auto* values = dosage_main.as<uint16_t>();
-        PglErr err = hardcalls ? PgrGet(nullptr, pssi, samples, row, &reader, g)
-            : PgrGetD(nullptr, pssi, samples, row, &reader, g, present, values, &dosage_ct);
+        PglErr err = hardcalls ? PgrGet(mask, subset_index, count, row, &reader, g)
+            : PgrGetD(mask, subset_index, count, row, &reader, g, present, values, &dosage_ct);
         require(err == kPglRetSuccess, "PGEN read failed: " + prefix + " variant row " + std::to_string(row+1));
-        std::vector<float> out(subset.size(), -9);
-        size_t dst = 0, d = 0;
-        constexpr size_t bits = sizeof(uintptr_t)*8;
-        for (uint32_t i = 0; i < samples; ++i) {
-            unsigned code = (g[i/(bits/2)] >> (2*(i%(bits/2)))) & 3;
+        std::vector<float> out(count);
+        uint32_t d = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto code = GetNyparrEntry(g,i);
             float value = code == 3 ? -9.0f : static_cast<float>(code);
-            if (dosage_ct && ((present[i/bits] >> (i%bits)) & 1)) value = values[d++] / 16384.0f;
-            if (dst < subset.size() && subset[dst] == i) out[dst++] = value;
+            if (dosage_ct && IsSet(present,i)) value = values[d++] / 16384.0f;
+            out[i] = value;
         }
         require(d == dosage_ct, "Inconsistent PGEN dosage count");
         return out;
@@ -193,14 +214,15 @@ struct VcfSource : GenotypeSource {
     int hds_capacity = 0;
     int32_t* gt = nullptr;
     int gt_capacity = 0;
-    explicit VcfSource(const std::string& path, int threads) {
+    VcfSource(const std::string& path, int threads, const std::vector<uint32_t>& selected)
+        : GenotypeSource(selected) {
         prefix = path;
         reader = std::make_unique<IndexedReader>(path,"",threads);
         samples = bcf_hdr_nsamples(reader->header);
         require(samples > 0, "Reference VCF/BCF has no samples: " + path);
     }
     ~VcfSource() override { free(ds); free(hds); free(gt); }
-    std::vector<float> read(const RefVariant& variant, const std::vector<uint32_t>& subset, bool hardcalls) override {
+    std::vector<float> read(const RefVariant& variant, bool hardcalls) override {
         const auto& loc = variant;
         const char* raw_chr = bcf_hdr_id2name(reader->header,loc.row);
         require(raw_chr,"Invalid reference VCF contig ID");
@@ -337,10 +359,10 @@ class Reference {
     bool hardcalls_;
     ReferenceFilters filters_;
 public:
+    std::vector<uint32_t> subset;  // Fixed in panel order and shared by all shard readers.
     std::vector<std::unique_ptr<GenotypeSource>> shards;
     ScratchDirectory scratch;
     ReferenceStore store;
-    std::vector<uint32_t> subset;
     size_t multiallelic_skipped = 0, duplicates_skipped = 0, genotype_reads = 0;
     ReferenceQCCounts qc_counts;
     Reference(const std::vector<std::string>& prefixes, const Windows& windows, int64_t radius,
@@ -353,7 +375,7 @@ public:
             if (vcf_input) {
                 prefix = fs::canonical(prefix).string();
                 require(unique_prefixes.insert(prefix).second, "Repeated VCF reference shard: " + prefix);
-                auto shard = std::make_unique<VcfSource>(prefix,threads);
+                auto shard = std::make_unique<VcfSource>(prefix,threads,subset);
                 auto* hdr = shard->reader->header;
                 std::vector<std::pair<std::string,std::string>> current_samples;
                 for (int i = 0; i < bcf_hdr_nsamples(hdr); ++i) current_samples.emplace_back("0",hdr->samples[i]);
@@ -370,7 +392,7 @@ public:
             prefix = fs::weakly_canonical(prefix).string();
             require(unique_prefixes.insert(prefix).second, "Repeated PGEN shard: " + prefix);
             require(fs::exists(prefix+".pgen"), "Missing " + prefix + ".pgen");
-            auto shard = std::make_unique<PgenSource>();
+            auto shard = std::make_unique<PgenSource>(subset);
             shard->prefix = prefix;
             auto current_samples = read_samples(prefix+".psam");
             if (shards.empty()) {
@@ -406,7 +428,7 @@ public:
             return hit->second.data;
         }
         const auto v = store.get(i);
-        auto data = std::make_shared<std::vector<float>>(shards[v.shard]->read(v, subset, hardcalls_));
+        auto data = std::make_shared<std::vector<float>>(shards[v.shard]->read(v, hardcalls_));
         ++genotype_reads;
         if (!store.qc(i)) {
             double sum = 0, ss = 0;

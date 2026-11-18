@@ -22,3 +22,14 @@ plink2 --pfile panel --validate
 
 Generated with PLINK v2.0.0-b.1.3-devLM (26 Oct 2026) and bcftools 1.25.
 Running the test suite only requires the checked-in files and bcftools.
+
+The `multiword` fileset expands the six biallelic rows to 1,089 synthetic
+samples. It exercises noncontiguous selections of 64, 65 and 129 people,
+including indices on both sides of packed-word boundaries. The test compares
+the PGEN results with a VCF physically subset to the same samples. To rebuild
+the PGEN from its checked-in VCF, run the following command.
+
+```sh
+plink2 --vcf multiword.vcf.gz dosage=DS --hard-call-threshold 0.25 \
+  --dosage-erase-threshold 0 --make-pgen --out multiword
+```

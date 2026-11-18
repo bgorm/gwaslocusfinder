@@ -448,6 +448,32 @@ class PublicPluginTests(unittest.TestCase):
                             self.assertEqual(float(hit["R2"]) == 1, hardcalls)
                             self.assertEqual(min(int(r["START"]) for r in tables["loci"]), 700)
 
+    def test_pgen_subsets_across_packed_word_boundaries(self):
+        if not self.supports_pgen:
+            self.skipTest("PGEN decoder disabled in this build")
+        fixture = ROOT / "tests/fixtures/multiword"
+        selection = [0, 31, 32, 63, 64, 65, 127, 128, 255, 256, 511, 512, 1023, 1024, 1088]
+        selection = list(dict.fromkeys(selection + list(range(2, 1089, 7))))
+        keep = self.d / "subset.keep"
+        for count in (64, 65, 129):
+            keep.write_text("".join(f"s{i}\n" for i in reversed(selection[:count])))
+            vcf_subset = self.d / f"selected-{count}.bcf"
+            command([BCFTOOLS, "view", "-S", keep, "-Ob", "-W", "-o", vcf_subset,
+                     fixture.with_suffix(".vcf.gz")])
+            for hardcalls in (False, True):
+                with self.subTest(count=count, hardcalls=hardcalls):
+                    outputs = []
+                    for name, args in [("pgen", ["--pfile", fixture, "--keep", keep]),
+                                       ("vcf", ["--vcf-ref", vcf_subset])]:
+                        if hardcalls:
+                            args.append("--hardcalls")
+                        prefix, index, _ = self.run_plugin(name, reference=False, general=["--no-version"],
+                                                           specific=args)
+                        outputs.append((index.read_bytes(), [self.report(prefix, table) for table in
+                                        ("candidates", "loci", "independent", "leads", "excluded")]))
+                    self.assertEqual(outputs[0], outputs[1])
+                    self.assertTrue(outputs[0][1][0])
+
     def test_tagging_visits_populated_ld_windows_in_gwas_coordinates(self):
         x = [0, 1, 2] * 3
         self.variants = [(20, "distant", x, 0, 0), (900, "left", x, 2, 0),
