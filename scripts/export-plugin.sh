@@ -15,6 +15,8 @@ files=(
     src/core.hpp src/io.hpp src/storage.hpp src/reference.hpp src/entry.hpp src/engine.cpp src/plugin.cpp
     scripts/bootstrap.sh scripts/export-plugin.sh scripts/benchmark.py benchmarks/README.md
     benchmarks/measurements/provenance.json benchmarks/measurements/{84cde27,1a22388,initial}/*/metrics.json
+    benchmarks/pgen-subset/{README.md,instrument.py,measure.py,pgen_probe.hpp}
+    benchmarks/pgen-subset/measurements/{builds,regional-396,chr22-396,dosage-396,hardcalls-396,regional-3005,regional-3163,dosage-3005}.json
     tests/fixtures/README.md tests/fixtures/panel.vcf tests/fixtures/panel.pgen tests/fixtures/panel.pvar tests/fixtures/panel.psam
     tests/fixtures/multiword.{vcf.gz,pgen,pvar,psam}
     tests/test_plugin.py tests/test_storage.cpp .github/workflows/build.yml

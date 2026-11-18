@@ -1,0 +1,12 @@
+{
+  "baseline": {
+    "commit": "50507a2adec2a68d3ca218bfc1557705327b8414",
+    "release_sha256": "050affdc29db1851e92c5ad3fa6aad19020c087cb13dd8a152907797acd03220",
+    "profile_sha256": "dc6f614145d610649f2b9ece6dfce27c70d2d4c9ad365e5325624d4e8705e71a"
+  },
+  "candidate": {
+    "commit": "0972478d05a57f1830b8b488374a35c2831c3a7c",
+    "release_sha256": "61e1e2ed6f2c2c2614c6d03177172fe1b23a8a278124e3409e4026656ab9b29f",
+    "profile_sha256": "a45080b17de56a26c0342be2ebc8adb6a0454cbd99b90add4390eb962e765d87"
+  }
+}

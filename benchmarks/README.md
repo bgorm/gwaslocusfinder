@@ -41,6 +41,10 @@ every eighth individual in shard order. Its time includes decoding full PGEN
 rows, followed by QC and LD on the selected individuals. Genotype reads count
 cache misses, including repeat reads of the same variant.
 
+For paired timings of full-row and sample-subset PGEN decoding on the same
+EA4 inputs and a panel with stored dosages, see the
+[PGEN sample-subset benchmark](pgen-subset/README.md).
+
 The one- and two-phenotype runs used the same 369,218-record chromosome 22
 BCF. Keeping the input BCF fixed controls which alleles are present in the GWAS.
 Selecting both phenotypes expands the LD windows visited during tagging.
